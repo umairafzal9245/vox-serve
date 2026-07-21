@@ -841,16 +841,51 @@ class ZonosModel(BaseLM):
             self._spk_emb_cache.popitem(last=False)
         return emb
 
-    def preprocess(self, prompt: str = None, audio_path: str = None, **kwargs) -> PreprocessOutput:
+    def preprocess(
+        self,
+        prompt: str = None,
+        audio_path: str = None,
+        language: str = None,
+        speaking_rate: float = None,
+        pitch_std: float = None,
+        emotion=None,
+        **kwargs,
+    ) -> PreprocessOutput:
         """Prepare the prompt for the model.
 
         When ``audio_path`` is provided, a speaker embedding is extracted from the
         reference audio for zero-shot voice cloning; otherwise the default speaker
         embedding is used.
+
+        Optional conditioning controls (Zonos-specific):
+            speaking_rate: Speaking speed in phonemes/min (~15 normal, 30 fast, 10 slow).
+            pitch_std: Pitch variation / expressiveness (20-45 normal, 60-150 expressive).
+            emotion: 8-value vector [Happiness, Sadness, Disgust, Fear, Surprise,
+                Anger, Other, Neutral]; accepts a list or comma-separated string.
         """
-        language = kwargs.get("language") or "en-us"
+        language = language or "en-us"
         speaker = self._speaker_embedding_from_audio(audio_path) if audio_path else None
-        cond_dict = self._make_cond_dict(text=prompt, language=language, speaker=speaker)
+
+        # Forward only the conditioning controls that were explicitly provided so
+        # unset ones keep their Zonos defaults.
+        cond_kwargs = {}
+        if speaking_rate is not None:
+            cond_kwargs["speaking_rate"] = float(speaking_rate)
+        if pitch_std is not None:
+            cond_kwargs["pitch_std"] = float(pitch_std)
+        if emotion is not None:
+            emo = emotion
+            if isinstance(emo, str):
+                emo = [float(x) for x in emo.split(",") if x.strip() != ""]
+            emo = [float(x) for x in emo]
+            if len(emo) == 8:
+                cond_kwargs["emotion"] = emo
+            else:
+                self.logger.warning(
+                    f"Ignoring emotion: expected 8 values, got {len(emo)}"
+                )
+
+        cond_dict = self._make_cond_dict(text=prompt, language=language, speaker=speaker, **cond_kwargs)
         input_features = self._prepare_conditioning(cond_dict)
 
         prefix_tokens = torch.cat(

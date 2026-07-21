@@ -151,6 +151,26 @@ Client → server (one JSON message per utterance):
 
 `format` is `"pcm"` (raw int16, default) or `"opus"`. Use `"audio_base64"` for a one-off reference instead of `voice_id`. Send `{"type": "close"}` to end the session.
 
+**Zonos conditioning controls** (all optional, per utterance):
+
+```json
+{
+  "text": "I'm so excited to see you!",
+  "voice_id": "my-voice",
+  "speaking_rate": 20,
+  "pitch_std": 90,
+  "emotion": [0.8, 0, 0, 0, 0.1, 0, 0, 0.1]
+}
+```
+
+| field | range / format | meaning |
+| --- | --- | --- |
+| `speaking_rate` | phonemes/min (~15 normal, 30 fast, 10 slow) | speaking speed |
+| `pitch_std` | 20–45 normal, 60–150 expressive | pitch variation / expressiveness |
+| `emotion` | 8-value list `[happiness, sadness, disgust, fear, surprise, anger, other, neutral]` (auto-normalized) | emotional tone |
+
+Emotion is entangled with pitch — stronger emotion usually pairs well with a higher `pitch_std`. Unset controls keep their Zonos defaults.
+
 Server → client, per utterance:
 
 ```

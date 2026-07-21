@@ -1077,7 +1077,11 @@ def _resolve_audio_and_kwargs(msg: dict):
         is_temp_audio = True
 
     model_kwargs = {}
-    for key in ("language", "speaker", "ref_text", "instruct", "x_vector_only_mode"):
+    for key in (
+        "language", "speaker", "ref_text", "instruct", "x_vector_only_mode",
+        # Zonos conditioning controls
+        "speaking_rate", "pitch_std", "emotion",
+    ):
         if msg.get(key) is not None:
             model_kwargs[key] = msg[key]
 
@@ -1098,6 +1102,11 @@ async def ws_generate(websocket: WebSocket):
     Optional one-off reference instead of voice_id: ``"audio_base64": "<wav>"``.
     Set ``"format": "opus"`` for ~10x smaller frames (transparent for speech);
     defaults to raw ``"pcm"``. Send ``{"type": "close"}`` to end the session.
+
+    Zonos conditioning controls (all optional): ``"speaking_rate"`` (phonemes/min,
+    ~15 normal), ``"pitch_std"`` (expressiveness, 20-45 normal / 60-150 expressive),
+    and ``"emotion"`` (8-value list [happiness, sadness, disgust, fear, surprise,
+    anger, other, neutral]).
 
     Server -> client, per utterance::
 
