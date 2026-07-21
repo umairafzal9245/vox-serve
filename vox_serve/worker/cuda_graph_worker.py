@@ -1433,92 +1433,101 @@ class CudaGraphWorker(ModelWorker):
             self.nvtx_range_pop()
             return
 
-        # Update batch size to handle multiple chunks
-        actual_batch_size = len(token_ids)
-        padded_batch_size = self._get_cuda_graph_batch_size(actual_batch_size)
+        # The detokenization CUDA-graph buffers are sized for max_batch_size. The
+        # scheduler normally caps the number of chunks, but under heavy accumulation
+        # (e.g. small detokenize_interval) it can hand us more chunks than fit. Process
+        # in sub-batches of max_batch_size so we never overflow the fixed buffers and
+        # never drop audio, regardless of how many chunks arrive.
+        total_chunks = len(token_ids)
+        needs_cache = self.cuda_graph_buffers["detokenize_cache"] is not None
 
-        self.logger.debug(
-            "Using detokenization CUDA graph with padded batch size %d (actual: %d)",
-            padded_batch_size, actual_batch_size
-        )
+        for start in range(0, total_chunks, self.max_batch_size):
+            end = min(start + self.max_batch_size, total_chunks)
+            slice_token_ids = token_ids[start:end]
+            slice_mapping = request_chunk_mapping[start:end]
+            slice_caches = decoder_caches[start:end] if decoder_caches else []
+            actual_batch_size = len(slice_token_ids)
+            padded_batch_size = self._get_cuda_graph_batch_size(actual_batch_size)
 
-        # Stack token_ids and transfer to detokenizer device if needed
-        token_ids_stacked = torch.stack(token_ids, dim=0)
-        if self.detokenizer_device != self.device:
-            self.nvtx_range_push("transfer_to_detokenizer")
-            token_ids_stacked = token_ids_stacked.to(self.detokenizer_device, non_blocking=True)
-            torch.cuda.synchronize(device=self.detokenizer_device)
-            self.nvtx_range_pop()
-
-        self.cuda_graph_buffers["detokenize_input"][:actual_batch_size].copy_(token_ids_stacked)
-
-        # If a decoder cache is required, batch-merge request caches and copy into the CUDA buffer
-        if self.cuda_graph_buffers["detokenize_cache"] is not None:
-            # Merge per-request caches along batch dimension
-            batched_cache = DecoderCache.cat(decoder_caches)
-            # Slice the buffer to the actual batch size and copy data from batched_cache
-            sliced_buffer = self.cuda_graph_buffers["detokenize_cache"][:actual_batch_size]
-            sliced_buffer.copy_from(batched_cache)
-
-        graph = self.cuda_graphs_detokenization[padded_batch_size]
-
-        # Execute on the correct device
-        with torch.cuda.device(self.detokenizer_device):
-            self.nvtx_range_push("detokenize_replay")
-            graph.replay()
-            torch.cuda.synchronize()
-            self.nvtx_range_pop()
-
-        # Only take outputs for actual batch size
-        audio_tensors = self.cuda_graph_buffers["detokenize_output"][:actual_batch_size]
-
-        # Copy back updated decoder caches to each request
-        if self.cuda_graph_buffers["detokenize_cache"] is not None:
-            for i, (req_idx, _chunk_idx) in enumerate(request_chunk_mapping):
-                req = requests[req_idx]
-                # Slice the buffer for this specific request and copy to the request's cache
-                req.decoder_cache.copy_from(self.cuda_graph_buffers["detokenize_cache"][i : i + 1])
-
-        if self.needs_watermarking:
-            for i in range(audio_tensors.shape[0]):
-                audio_tensors[i, 0] = self.run_watermark(audio_tensors[i, 0], orig_sr=24000)
-
-        # Process each chunk and assign to the corresponding request
-        for i, (req_idx, chunk_idx) in enumerate(request_chunk_mapping):
-            req = requests[req_idx]
-            decode_idx = req.audio_decode_idx[chunk_idx]
-
-            audio = audio_tensors[i].detach().cpu().numpy()
-            audio_int16 = (audio * 32767).astype(np.int16)
-
-            last_chunk_len = len(
-                req.lm_output_audio_tokens[
-                    decode_idx : decode_idx + self.detokenize_interval
-                ]
+            self.logger.debug(
+                "Using detokenization CUDA graph with padded batch size %d (actual: %d, chunk %d-%d of %d)",
+                padded_batch_size, actual_batch_size, start, end, total_chunks
             )
-            if last_chunk_len < self.detokenize_interval:
-                # remove the padded audio
-                trim_len = int(
-                    audio_int16.shape[1]
-                    * (last_chunk_len - 0.5)
-                    / self.detokenize_interval
+
+            # Stack token_ids and transfer to detokenizer device if needed
+            token_ids_stacked = torch.stack(slice_token_ids, dim=0)
+            if self.detokenizer_device != self.device:
+                self.nvtx_range_push("transfer_to_detokenizer")
+                token_ids_stacked = token_ids_stacked.to(self.detokenizer_device, non_blocking=True)
+                torch.cuda.synchronize(device=self.detokenizer_device)
+                self.nvtx_range_pop()
+
+            self.cuda_graph_buffers["detokenize_input"][:actual_batch_size].copy_(token_ids_stacked)
+
+            # If a decoder cache is required, batch-merge request caches and copy into the CUDA buffer
+            if needs_cache:
+                batched_cache = DecoderCache.cat(slice_caches)
+                sliced_buffer = self.cuda_graph_buffers["detokenize_cache"][:actual_batch_size]
+                sliced_buffer.copy_from(batched_cache)
+
+            graph = self.cuda_graphs_detokenization[padded_batch_size]
+
+            # Execute on the correct device
+            with torch.cuda.device(self.detokenizer_device):
+                self.nvtx_range_push("detokenize_replay")
+                graph.replay()
+                torch.cuda.synchronize()
+                self.nvtx_range_pop()
+
+            # Only take outputs for actual batch size
+            audio_tensors = self.cuda_graph_buffers["detokenize_output"][:actual_batch_size]
+
+            # Copy back updated decoder caches to each request
+            if needs_cache:
+                for i, (req_idx, _chunk_idx) in enumerate(slice_mapping):
+                    req = requests[req_idx]
+                    req.decoder_cache.copy_from(self.cuda_graph_buffers["detokenize_cache"][i : i + 1])
+
+            if self.needs_watermarking:
+                for i in range(audio_tensors.shape[0]):
+                    audio_tensors[i, 0] = self.run_watermark(audio_tensors[i, 0], orig_sr=24000)
+
+            # Process each chunk and assign to the corresponding request
+            for i, (req_idx, chunk_idx) in enumerate(slice_mapping):
+                req = requests[req_idx]
+                decode_idx = req.audio_decode_idx[chunk_idx]
+
+                audio = audio_tensors[i].detach().cpu().numpy()
+                audio_int16 = (audio * 32767).astype(np.int16)
+
+                last_chunk_len = len(
+                    req.lm_output_audio_tokens[
+                        decode_idx : decode_idx + self.detokenize_interval
+                    ]
                 )
-                audio_int16 = audio_int16[:, :trim_len]
+                if last_chunk_len < self.detokenize_interval:
+                    # remove the padded audio
+                    trim_len = int(
+                        audio_int16.shape[1]
+                        * (last_chunk_len - 0.5)
+                        / self.detokenize_interval
+                    )
+                    audio_int16 = audio_int16[:, :trim_len]
 
-            # TTFA first-chunk: when the model pre-seeded N silence frames at the
-            # head of lm_output_audio_tokens, this chunk's slice [0:25] is
-            # ``N silence ++ first_chunk_frames real`` (see BaseLM.first_chunk_frames).
-            # Drop the leading silence samples from the PCM. Done AFTER tail trim
-            # so the early-EOS (real_frames < first_chunk_frames) case still works.
-            first_chunk_frames = getattr(self.model, "first_chunk_frames", None)
-            if decode_idx == 0 and first_chunk_frames is not None:
-                n_silence = self.detokenize_interval - first_chunk_frames
-                samples_per_frame = self.model.output_audio_length // self.detokenize_interval
-                prefix_samples = n_silence * samples_per_frame
-                audio_int16 = audio_int16[:, prefix_samples:]
+                # TTFA first-chunk: when the model pre-seeded N silence frames at the
+                # head of lm_output_audio_tokens, this chunk's slice [0:25] is
+                # ``N silence ++ first_chunk_frames real`` (see BaseLM.first_chunk_frames).
+                # Drop the leading silence samples from the PCM. Done AFTER tail trim
+                # so the early-EOS (real_frames < first_chunk_frames) case still works.
+                first_chunk_frames = getattr(self.model, "first_chunk_frames", None)
+                if decode_idx == 0 and first_chunk_frames is not None:
+                    n_silence = self.detokenize_interval - first_chunk_frames
+                    samples_per_frame = self.model.output_audio_length // self.detokenize_interval
+                    prefix_samples = n_silence * samples_per_frame
+                    audio_int16 = audio_int16[:, prefix_samples:]
 
-            audio_bytes = audio_int16.tobytes()
-            req.output_audio.put(audio_bytes)
+                audio_bytes = audio_int16.tobytes()
+                req.output_audio.put(audio_bytes)
 
         # Check if any request is completely done
         for req in requests:
