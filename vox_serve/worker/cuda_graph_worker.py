@@ -59,7 +59,11 @@ class CudaGraphWorker(ModelWorker):
         # sort in decreasing order to the cuda graph for largest batch is captured first and the smaller
         # shapes can reuse the memory
         self.cuda_graph_batch_sizes = [2**i for i in range(int(np.log2(self.max_batch_size)) + 1)][::-1]
-        self.cuda_graph_seq_len_buckets = [1024][::-1]
+        # Sorted descending so the largest graph is captured first and smaller
+        # shapes reuse its memory pool. Multiple buckets let the scheduler pick the
+        # smallest graph that fits: light batches use 1024 (fast), while high
+        # concurrency / longer text falls back to 2048 instead of overflowing.
+        self.cuda_graph_seq_len_buckets = [2048, 1024]
         self.prefill_graph_batch_size = 8
         self.cuda_graph_pool = torch.cuda.graph_pool_handle()
         self.depth_unrolled_graph_pool = torch.cuda.graph_pool_handle()
