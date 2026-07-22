@@ -103,6 +103,7 @@ Multipart form fields:
 |-------|----------|-------------|
 | `text` | yes | Text to synthesize |
 | `streaming` | no (default `true`) | Stream a WAV (`true`) or return a complete file (`false`) |
+| `sample_rate` | no (default `24000`) | Output sample rate in Hz: `16000` or `24000` |
 | `audio` | no | Reference audio file for voice cloning (uploaded per request) |
 | `voice_id` | no | Pre-registered voice (see `/voices`) — clone with **no per-request upload** |
 | `language`, `speaker`, `ref_text`, `instruct`, `x_vector_only_mode` | no | Model-specific parameters |
@@ -111,6 +112,10 @@ Multipart form fields:
 # Default voice, streaming
 curl -X POST http://localhost:8000/generate \
   -F "text=Hello world" -F "streaming=true" -o out.wav
+
+# 16 kHz output
+curl -X POST http://localhost:8000/generate \
+  -F "text=Hello world" -F "streaming=true" -F "sample_rate=16000" -o out_16k.wav
 
 # Voice cloning by uploading a reference each request
 curl -X POST http://localhost:8000/generate \
@@ -149,7 +154,7 @@ Client → server (one JSON message per utterance):
 {"text": "Hello world", "voice_id": "my-voice", "format": "opus"}
 ```
 
-`format` is `"pcm"` (raw int16, default) or `"opus"`. Use `"audio_base64"` for a one-off reference instead of `voice_id`. Send `{"type": "close"}` to end the session.
+`format` is `"pcm"` (raw int16, default) or `"opus"`. Use `"audio_base64"` for a one-off reference instead of `voice_id`. Optional `"sample_rate": 16000` (or `24000`, default) resamples the native 24 kHz model output; Opus encodes at the requested rate. Send `{"type": "close"}` to end the session.
 
 **Zonos conditioning controls** (all optional, per utterance):
 
@@ -174,7 +179,7 @@ Emotion is entangled with pitch — stronger emotion usually pairs well with a h
 Server → client, per utterance:
 
 ```
-{"type": "start", "request_id": "...", "sample_rate": 24000, "channels": 1, "format": "opus", "frame_ms": 20}
+{"type": "start", "request_id": "...", "sample_rate": 16000, "channels": 1, "format": "opus", "frame_ms": 20}
 <binary frame> <binary frame> ...   # PCM chunks, or one Opus packet per frame
 {"type": "end", "request_id": "..."}
 ```

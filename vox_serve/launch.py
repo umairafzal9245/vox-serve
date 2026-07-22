@@ -2,6 +2,7 @@
 
 import asyncio
 import atexit
+import audioop
 import base64
 import collections
 import io
@@ -699,6 +700,7 @@ class APIServer:
         text: str = None,
         audio_path: str = None,
         model_kwargs: Dict = None,
+        sample_rate: int = None,
     ) -> str:
         """
         Generate audio from text and return path to the audio file.
@@ -707,6 +709,7 @@ class APIServer:
             text: Input text to synthesize (optional if audio_path provided)
             audio_path: Path to input audio file (optional)
             model_kwargs: Optional model-specific parameters (e.g., language, speaker).
+            sample_rate: Output sample rate (16000 or 24000). Defaults to native 24 kHz.
 
         Returns:
             Path to the generated audio file
@@ -716,6 +719,7 @@ class APIServer:
         """
         request_id = str(uuid.uuid4())
         self.logger.info(f"Request {request_id} joined for generation")
+        out_sr = sample_rate if sample_rate is not None else _NATIVE_SAMPLE_RATE
 
         # Register this request for concurrent processing
         completion_event = threading.Event()
@@ -750,12 +754,17 @@ class APIServer:
             if not audio_chunks:
                 raise HTTPException(status_code=500, detail="No audio generated")
 
+            # Optionally resample native 24 kHz PCM to the requested rate
+            if out_sr != _NATIVE_SAMPLE_RATE:
+                resampler = PcmResampler(_NATIVE_SAMPLE_RATE, out_sr)
+                audio_chunks = [c for c in (resampler.process(c) for c in audio_chunks) if c]
+
             # Save to WAV file
             output_file = self.output_dir / f"{request_id}.wav"
             with wave.open(str(output_file), "wb") as wf:
                 wf.setnchannels(1)  # Mono
                 wf.setsampwidth(2)  # 16-bit
-                wf.setframerate(24000)  # 24kHz as per SNAC
+                wf.setframerate(out_sr)
                 for chunk in audio_chunks:
                     wf.writeframes(chunk)
 
@@ -817,6 +826,7 @@ async def generate(
     audio: Optional[UploadFile] = File(None),
     voice_id: Optional[str] = Form(None),
     streaming: bool = Form(True),
+    sample_rate: Optional[int] = Form(None),
     # Model-specific parameters (used by models like Qwen3-TTS)
     language: Optional[str] = Form(None),
     speaker: Optional[str] = Form(None),
@@ -831,6 +841,7 @@ async def generate(
         text: Input text to synthesize
         audio: Optional input audio file
         streaming: Whether to return streaming response (default: True)
+        sample_rate: Output sample rate in Hz (16000 or 24000; default 24000)
         language: Language code for synthesis (model-specific, e.g., "en", "zh", "auto")
         speaker: Speaker ID for multi-speaker models (model-specific)
         ref_text: Reference text for voice cloning (used with audio for ICL mode)
@@ -842,6 +853,11 @@ async def generate(
     """
     if api_server is None:
         raise HTTPException(status_code=503, detail="Server not ready")
+
+    try:
+        out_sr = _parse_sample_rate(sample_rate)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
     audio_path = None
     is_temp_audio = False  # only temp uploads get cleaned up; registered voices persist
@@ -880,12 +896,12 @@ async def generate(
             request_id = api_server.start_streaming_request(text, audio_path, model_kwargs)
 
             async def audio_stream():
-                # WAV header for 24kHz mono 16-bit audio
+                # WAV header for mono 16-bit audio at the requested sample rate
                 wav_header = io.BytesIO()
                 with wave.open(wav_header, "wb") as wf:
                     wf.setnchannels(1)  # Mono
                     wf.setsampwidth(2)  # 16-bit
-                    wf.setframerate(24000)  # 24kHz
+                    wf.setframerate(out_sr)
                     wf.writeframes(b"")  # Empty data for header
 
                 # Get header bytes and correct the chunk size for streaming
@@ -895,9 +911,18 @@ async def generate(
                 # Send WAV header first
                 yield header_bytes
 
+                resampler = (
+                    PcmResampler(_NATIVE_SAMPLE_RATE, out_sr)
+                    if out_sr != _NATIVE_SAMPLE_RATE
+                    else None
+                )
+
                 # Stream audio chunks asynchronously
                 async for chunk in api_server.async_stream_chunks(request_id):
-                    yield chunk
+                    if resampler is not None:
+                        chunk = resampler.process(chunk)
+                    if chunk:
+                        yield chunk
 
             return StreamingResponse(
                 audio_stream(),
@@ -909,7 +934,9 @@ async def generate(
             )
         else:
             # Non-streaming response
-            audio_file = await run_in_threadpool(api_server.generate_audio, text, audio_path, model_kwargs)
+            audio_file = await run_in_threadpool(
+                api_server.generate_audio, text, audio_path, model_kwargs, out_sr
+            )
             request_id = Path(audio_file).stem
 
             return FileResponse(path=audio_file, media_type="audio/wav", filename=f"{request_id}.wav")
@@ -1004,18 +1031,54 @@ async def delete_voice(voice_id: str):
 # WebSocket streaming endpoint (persistent connection, many utterances)
 # ============================================================================
 
-# Model audio is int16 PCM mono at this rate; Opus natively supports 24 kHz.
-_OPUS_SAMPLE_RATE = 24000
+# Model workers emit int16 PCM mono at this native rate. Clients may request
+# 16 kHz via sample_rate; the API resamples on the way out.
+_NATIVE_SAMPLE_RATE = 24000
+_SUPPORTED_SAMPLE_RATES = frozenset({16000, 24000})
 _OPUS_FRAME_MS = 20
-_OPUS_FRAME_SAMPLES = _OPUS_SAMPLE_RATE * _OPUS_FRAME_MS // 1000  # 480 samples
-_OPUS_FRAME_BYTES = _OPUS_FRAME_SAMPLES * 2  # 16-bit mono
 # 48 kbps mono is transparent for speech with headroom; still ~8x smaller than
-# raw PCM (384 kbps). Override via VOX_OPUS_BITRATE.
+# raw PCM (384 kbps @ 24 kHz). Override via VOX_OPUS_BITRATE.
 _OPUS_BITRATE = int(os.environ.get("VOX_OPUS_BITRATE", "48000"))
 
 
+def _parse_sample_rate(value) -> int:
+    """Validate and normalize a sample_rate request (default: native 24 kHz)."""
+    if value is None or value == "":
+        return _NATIVE_SAMPLE_RATE
+    try:
+        sr = int(value)
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"Invalid sample_rate {value!r}; supported: "
+            f"{sorted(_SUPPORTED_SAMPLE_RATES)}"
+        ) from e
+    if sr not in _SUPPORTED_SAMPLE_RATES:
+        raise ValueError(
+            f"Unsupported sample_rate={sr}; supported: "
+            f"{sorted(_SUPPORTED_SAMPLE_RATES)}"
+        )
+    return sr
+
+
+class PcmResampler:
+    """Streaming int16 mono resampler (stateful across chunks)."""
+
+    def __init__(self, src_rate: int, dst_rate: int):
+        self.src_rate = src_rate
+        self.dst_rate = dst_rate
+        self._state = None
+
+    def process(self, pcm_bytes: bytes) -> bytes:
+        if not pcm_bytes or self.src_rate == self.dst_rate:
+            return pcm_bytes
+        converted, self._state = audioop.ratecv(
+            pcm_bytes, 2, 1, self.src_rate, self.dst_rate, self._state
+        )
+        return converted
+
+
 class OpusStreamEncoder:
-    """Incremental Opus encoder for a stream of int16 PCM mono @ 24 kHz.
+    """Incremental Opus encoder for a stream of int16 PCM mono.
 
     Buffers PCM into fixed 20 ms frames and emits one raw Opus packet per
     frame. Raw packets (no container) keep latency minimal and let clients
@@ -1024,10 +1087,13 @@ class OpusStreamEncoder:
     delimit packets (no length prefix needed).
     """
 
-    def __init__(self):
+    def __init__(self, sample_rate: int = _NATIVE_SAMPLE_RATE):
         import opuslib
 
-        self._enc = opuslib.Encoder(_OPUS_SAMPLE_RATE, 1, opuslib.APPLICATION_AUDIO)
+        self.sample_rate = sample_rate
+        self._frame_samples = sample_rate * _OPUS_FRAME_MS // 1000
+        self._frame_bytes = self._frame_samples * 2  # 16-bit mono
+        self._enc = opuslib.Encoder(sample_rate, 1, opuslib.APPLICATION_AUDIO)
         try:
             self._enc.bitrate = _OPUS_BITRATE
         except Exception:  # noqa: BLE001 - fall back to libopus auto bitrate
@@ -1038,19 +1104,19 @@ class OpusStreamEncoder:
         """Feed PCM bytes; return zero or more complete Opus packets."""
         self._buf.extend(pcm_bytes)
         packets = []
-        while len(self._buf) >= _OPUS_FRAME_BYTES:
-            frame = bytes(self._buf[:_OPUS_FRAME_BYTES])
-            del self._buf[:_OPUS_FRAME_BYTES]
-            packets.append(self._enc.encode(frame, _OPUS_FRAME_SAMPLES))
+        while len(self._buf) >= self._frame_bytes:
+            frame = bytes(self._buf[: self._frame_bytes])
+            del self._buf[: self._frame_bytes]
+            packets.append(self._enc.encode(frame, self._frame_samples))
         return packets
 
     def flush(self) -> list[bytes]:
         """Encode any leftover tail, zero-padded to a full frame."""
         if not self._buf:
             return []
-        frame = bytes(self._buf) + b"\x00" * (_OPUS_FRAME_BYTES - len(self._buf))
+        frame = bytes(self._buf) + b"\x00" * (self._frame_bytes - len(self._buf))
         self._buf.clear()
-        return [self._enc.encode(frame, _OPUS_FRAME_SAMPLES)]
+        return [self._enc.encode(frame, self._frame_samples)]
 
 
 def _resolve_audio_and_kwargs(msg: dict):
@@ -1101,7 +1167,9 @@ async def ws_generate(websocket: WebSocket):
 
     Optional one-off reference instead of voice_id: ``"audio_base64": "<wav>"``.
     Set ``"format": "opus"`` for ~10x smaller frames (transparent for speech);
-    defaults to raw ``"pcm"``. Send ``{"type": "close"}`` to end the session.
+    defaults to raw ``"pcm"``. Optional ``"sample_rate": 16000`` (or 24000,
+    default) resamples output; Opus encodes at the requested rate. Send
+    ``{"type": "close"}`` to end the session.
 
     Zonos conditioning controls (all optional): ``"speaking_rate"`` (phonemes/min,
     ~15 normal), ``"pitch_std"`` (expressiveness, 20-45 normal / 60-150 expressive),
@@ -1110,7 +1178,7 @@ async def ws_generate(websocket: WebSocket):
 
     Server -> client, per utterance::
 
-        {"type": "start", "request_id": ..., "sample_rate": 24000,
+        {"type": "start", "request_id": ..., "sample_rate": 16000|24000,
          "channels": 1, "format": "pcm_s16le" | "opus", "frame_ms": 20}
         <binary frame> <binary frame> ...   # PCM chunks, or one Opus packet each
         {"type": "end", "request_id": ...}          # JSON text frame
@@ -1141,14 +1209,20 @@ async def ws_generate(websocket: WebSocket):
             request_id = None
             use_opus = str(msg.get("format", "pcm")).lower() == "opus"
             try:
+                out_sr = _parse_sample_rate(msg.get("sample_rate"))
                 audio_path, is_temp_audio, model_kwargs = _resolve_audio_and_kwargs(msg)
                 request_id = api_server.start_streaming_request(text, audio_path, model_kwargs)
 
-                opus_enc = OpusStreamEncoder() if use_opus else None
+                resampler = (
+                    PcmResampler(_NATIVE_SAMPLE_RATE, out_sr)
+                    if out_sr != _NATIVE_SAMPLE_RATE
+                    else None
+                )
+                opus_enc = OpusStreamEncoder(out_sr) if use_opus else None
                 await websocket.send_json({
                     "type": "start",
                     "request_id": request_id,
-                    "sample_rate": _OPUS_SAMPLE_RATE,
+                    "sample_rate": out_sr,
                     "channels": 1,
                     "format": "opus" if use_opus else "pcm_s16le",
                     "frame_ms": _OPUS_FRAME_MS if use_opus else None,
@@ -1157,6 +1231,10 @@ async def ws_generate(websocket: WebSocket):
                 async for chunk in api_server.async_stream_chunks(request_id):
                     if not chunk:
                         continue
+                    if resampler is not None:
+                        chunk = resampler.process(chunk)
+                        if not chunk:
+                            continue
                     if opus_enc is not None:
                         for pkt in opus_enc.encode(chunk):
                             await websocket.send_bytes(pkt)
@@ -1199,7 +1277,8 @@ class AudioSpeechRequest(BaseModel):
 
     Mirrors the payload sent by ``benchmarking/bench/adapters/voxtral.py``:
     ``{model, input, voice, language, response_format, stream, extra_params}``.
-    ``extra_params`` may carry ``cfg_alpha`` (classifier-free guidance scale).
+    ``extra_params`` may carry ``cfg_alpha`` (classifier-free guidance scale)
+    or ``sample_rate`` (16000 or 24000).
     """
 
     model: Optional[str] = None
@@ -1208,6 +1287,7 @@ class AudioSpeechRequest(BaseModel):
     language: Optional[str] = None
     response_format: Optional[str] = "pcm"
     stream: Optional[bool] = True
+    sample_rate: Optional[int] = None
     extra_params: Optional[Dict] = None
 
 
@@ -1217,10 +1297,19 @@ async def audio_speech(req: AudioSpeechRequest):
 
     Reuses the existing streaming machinery (``async_stream_chunks``); the worker
     already emits int16 PCM bytes, so unlike the ``/generate`` WAV route this
-    endpoint forwards them verbatim with ``media_type="audio/pcm"``.
+    endpoint forwards them (optionally resampled) with ``media_type="audio/pcm"``.
     """
     if api_server is None:
         raise HTTPException(status_code=503, detail="Server not ready")
+
+    try:
+        out_sr = _parse_sample_rate(
+            req.sample_rate
+            if req.sample_rate is not None
+            else (req.extra_params or {}).get("sample_rate")
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
     model_kwargs = {
         "voice": req.voice,
@@ -1232,13 +1321,24 @@ async def audio_speech(req: AudioSpeechRequest):
         request_id = api_server.start_streaming_request(req.input, None, model_kwargs)
 
         async def audio_stream():
+            resampler = (
+                PcmResampler(_NATIVE_SAMPLE_RATE, out_sr)
+                if out_sr != _NATIVE_SAMPLE_RATE
+                else None
+            )
             async for chunk in api_server.async_stream_chunks(request_id):
-                yield chunk
+                if resampler is not None:
+                    chunk = resampler.process(chunk)
+                if chunk:
+                    yield chunk
 
         return StreamingResponse(
             audio_stream(),
             media_type="audio/pcm",
-            headers={"Cache-Control": "no-cache"},
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Sample-Rate": str(out_sr),
+            },
         )
     except HTTPException:
         raise
@@ -1336,7 +1436,7 @@ async def send_text_chunk(
 
 
 @app.get("/generate/stream/{request_id}/audio")
-async def stream_audio(request_id: str):
+async def stream_audio(request_id: str, sample_rate: Optional[int] = None):
     """
     Start streaming audio output for an input streaming request.
 
@@ -1345,12 +1445,18 @@ async def stream_audio(request_id: str):
 
     Args:
         request_id: Request identifier from start_input_streaming
+        sample_rate: Output sample rate in Hz (16000 or 24000; default 24000)
 
     Returns:
         Streaming audio response (WAV format)
     """
     if api_server is None:
         raise HTTPException(status_code=503, detail="Server not ready")
+
+    try:
+        out_sr = _parse_sample_rate(sample_rate)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
     # Validate request exists
     with api_server.request_lock:
@@ -1364,21 +1470,30 @@ async def stream_audio(request_id: str):
             )
 
     async def audio_stream():
-        # WAV header for 24kHz mono 16-bit audio
+        # WAV header for mono 16-bit audio at the requested sample rate
         wav_header = io.BytesIO()
         with wave.open(wav_header, "wb") as wf:
             wf.setnchannels(1)  # Mono
             wf.setsampwidth(2)  # 16-bit
-            wf.setframerate(24000)  # 24kHz
+            wf.setframerate(out_sr)
             wf.writeframes(b"")  # Empty data for header
 
         wav_header.seek(0)
         header_bytes = wav_header.read()
         yield header_bytes
 
+        resampler = (
+            PcmResampler(_NATIVE_SAMPLE_RATE, out_sr)
+            if out_sr != _NATIVE_SAMPLE_RATE
+            else None
+        )
+
         # Stream audio chunks asynchronously
         async for chunk in api_server.async_stream_chunks(request_id):
-            yield chunk
+            if resampler is not None:
+                chunk = resampler.process(chunk)
+            if chunk:
+                yield chunk
 
     return StreamingResponse(
         audio_stream(),
