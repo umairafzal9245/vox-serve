@@ -595,11 +595,12 @@ class ZonosModel(BaseLM):
         # steps that must accumulate before the first audio chunk is emitted, so
         # it directly sets Time-To-First-Audio: TTFA ~= prefill + interval * decode
         # step. Lower = lower latency but more frequent (smaller) DAC decodes.
-        # Default 30 is a measured sweet spot: ~40% lower TTFA than 50 with no
-        # audible quality change (25 starts to degrade). Override with
+        # Default 40 trades a little TTFA for cleaner audio: larger DAC chunks
+        # reduce chunk-boundary artifacts and amplitude wobble vs 30, while still
+        # being well below the original 50. (25 clearly degrades.) Override with
         # VOX_ZONOS_DETOK_INTERVAL. Must stay > n_codebooks.
         self._detokenize_interval = max(
-            self._n_codebooks + 1, int(os.environ.get("VOX_ZONOS_DETOK_INTERVAL", "30"))
+            self._n_codebooks + 1, int(os.environ.get("VOX_ZONOS_DETOK_INTERVAL", "40"))
         )
         # DAC decodes (interval - n_codebooks) frames per chunk at a hop of 512
         # samples @44.1 kHz, then we resample to 24 kHz. Derive the exact output
@@ -628,19 +629,8 @@ class ZonosModel(BaseLM):
             cfg_scale=_cfg_scale,
         )
 
-        # Default conditioning tuned for call-center agents: a clear, natural
-        # speaking pace; steady (professional, low-variance) pitch; and a
-        # friendly-yet-neutral emotion with no negative affect. Applied when a
-        # request doesn't specify these; overridable per-request
-        # (speaking_rate/pitch_std/emotion) or globally via env.
-        self._default_speaking_rate = float(os.environ.get("VOX_ZONOS_SPEAKING_RATE", "15.0"))
-        self._default_pitch_std = float(os.environ.get("VOX_ZONOS_PITCH_STD", "20.0"))
-        _emo_env = os.environ.get("VOX_ZONOS_EMOTION")
-        if _emo_env:
-            self._default_emotion = [float(x) for x in _emo_env.split(",") if x.strip() != ""]
-        else:
-            # [Happiness, Sadness, Disgust, Fear, Surprise, Anger, Other, Neutral]
-            self._default_emotion = [0.35, 0.0, 0.0, 0.0, 0.0, 0.0, 0.15, 0.5]
+        # Conditioning (speaking_rate / pitch_std / emotion) is left to Zonos's
+        # own defaults unless a request overrides it per-call. See preprocess().
 
         self._get_default_speaker_embedding()
 
@@ -888,22 +878,28 @@ class ZonosModel(BaseLM):
         language = language or "en-us"
         speaker = self._speaker_embedding_from_audio(audio_path) if audio_path else None
 
-        # Apply call-center-tuned defaults, letting a request override any of
-        # them (speed=speaking_rate, pitch=pitch_std, emotion).
-        rate = speaking_rate if speaking_rate is not None else self._default_speaking_rate
-        pstd = pitch_std if pitch_std is not None else self._default_pitch_std
-        cond_kwargs = {"speaking_rate": float(rate), "pitch_std": float(pstd)}
+        # Only pass conditioning that the request explicitly sets; anything left
+        # unset falls through to Zonos's own built-in defaults in _make_cond_dict
+        # (speaking_rate=15, pitch_std=20, neutral-leaning emotion). Custom global
+        # defaults are intentionally not applied here because aggressive pitch_std
+        # / emotion values destabilize alignment and drop words.
+        cond_kwargs = {}
+        if speaking_rate is not None:
+            cond_kwargs["speaking_rate"] = float(speaking_rate)
+        if pitch_std is not None:
+            cond_kwargs["pitch_std"] = float(pitch_std)
 
-        emo = emotion if emotion is not None else self._default_emotion
-        if isinstance(emo, str):
-            emo = [float(x) for x in emo.split(",") if x.strip() != ""]
-        emo = [float(x) for x in emo]
-        if len(emo) == 8:
-            cond_kwargs["emotion"] = emo
-        else:
-            self.logger.warning(
-                f"Ignoring emotion: expected 8 values, got {len(emo)}"
-            )
+        if emotion is not None:
+            emo = emotion
+            if isinstance(emo, str):
+                emo = [float(x) for x in emo.split(",") if x.strip() != ""]
+            emo = [float(x) for x in emo]
+            if len(emo) == 8:
+                cond_kwargs["emotion"] = emo
+            else:
+                self.logger.warning(
+                    f"Ignoring emotion: expected 8 values, got {len(emo)}"
+                )
 
         cond_dict = self._make_cond_dict(text=prompt, language=language, speaker=speaker, **cond_kwargs)
         input_features = self._prepare_conditioning(cond_dict)
