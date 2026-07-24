@@ -709,7 +709,7 @@ class APIServer:
             text: Input text to synthesize (optional if audio_path provided)
             audio_path: Path to input audio file (optional)
             model_kwargs: Optional model-specific parameters (e.g., language, speaker).
-            sample_rate: Output sample rate (16000 or 24000). Defaults to native 24 kHz.
+            sample_rate: Output sample rate (8000, 16000, or 24000). Defaults to native 24 kHz.
 
         Returns:
             Path to the generated audio file
@@ -841,7 +841,7 @@ async def generate(
         text: Input text to synthesize
         audio: Optional input audio file
         streaming: Whether to return streaming response (default: True)
-        sample_rate: Output sample rate in Hz (16000 or 24000; default 24000)
+        sample_rate: Output sample rate in Hz (8000, 16000, or 24000; default 24000)
         language: Language code for synthesis (model-specific, e.g., "en", "zh", "auto")
         speaker: Speaker ID for multi-speaker models (model-specific)
         ref_text: Reference text for voice cloning (used with audio for ICL mode)
@@ -1031,10 +1031,11 @@ async def delete_voice(voice_id: str):
 # WebSocket streaming endpoint (persistent connection, many utterances)
 # ============================================================================
 
-# Model workers emit int16 PCM mono at this native rate. Clients may request
-# 16 kHz via sample_rate; the API resamples on the way out.
+# Model workers emit int16 PCM mono at this native rate. Clients may request a
+# lower rate (8 kHz telephony, 16 kHz) via sample_rate; the API resamples on the
+# way out. All supported rates are valid Opus input rates too.
 _NATIVE_SAMPLE_RATE = 24000
-_SUPPORTED_SAMPLE_RATES = frozenset({16000, 24000})
+_SUPPORTED_SAMPLE_RATES = frozenset({8000, 16000, 24000})
 _OPUS_FRAME_MS = 20
 # 48 kbps mono is transparent for speech with headroom; still ~8x smaller than
 # raw PCM (384 kbps @ 24 kHz). Override via VOX_OPUS_BITRATE.
@@ -1167,8 +1168,8 @@ async def ws_generate(websocket: WebSocket):
 
     Optional one-off reference instead of voice_id: ``"audio_base64": "<wav>"``.
     Set ``"format": "opus"`` for ~10x smaller frames (transparent for speech);
-    defaults to raw ``"pcm"``. Optional ``"sample_rate": 16000`` (or 24000,
-    default) resamples output; Opus encodes at the requested rate. Send
+    defaults to raw ``"pcm"``. Optional ``"sample_rate"`` of 8000, 16000, or
+    24000 (default) resamples output; Opus encodes at the requested rate. Send
     ``{"type": "close"}`` to end the session.
 
     Zonos conditioning controls (all optional): ``"speaking_rate"`` (phonemes/min,
@@ -1178,7 +1179,7 @@ async def ws_generate(websocket: WebSocket):
 
     Server -> client, per utterance::
 
-        {"type": "start", "request_id": ..., "sample_rate": 16000|24000,
+        {"type": "start", "request_id": ..., "sample_rate": 8000|16000|24000,
          "channels": 1, "format": "pcm_s16le" | "opus", "frame_ms": 20}
         <binary frame> <binary frame> ...   # PCM chunks, or one Opus packet each
         {"type": "end", "request_id": ...}          # JSON text frame
@@ -1278,7 +1279,7 @@ class AudioSpeechRequest(BaseModel):
     Mirrors the payload sent by ``benchmarking/bench/adapters/voxtral.py``:
     ``{model, input, voice, language, response_format, stream, extra_params}``.
     ``extra_params`` may carry ``cfg_alpha`` (classifier-free guidance scale)
-    or ``sample_rate`` (16000 or 24000).
+    or ``sample_rate`` (8000, 16000, or 24000).
     """
 
     model: Optional[str] = None
@@ -1445,7 +1446,7 @@ async def stream_audio(request_id: str, sample_rate: Optional[int] = None):
 
     Args:
         request_id: Request identifier from start_input_streaming
-        sample_rate: Output sample rate in Hz (16000 or 24000; default 24000)
+        sample_rate: Output sample rate in Hz (8000, 16000, or 24000; default 24000)
 
     Returns:
         Streaming audio response (WAV format)

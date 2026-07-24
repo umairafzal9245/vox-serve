@@ -103,7 +103,7 @@ Multipart form fields:
 |-------|----------|-------------|
 | `text` | yes | Text to synthesize |
 | `streaming` | no (default `true`) | Stream a WAV (`true`) or return a complete file (`false`) |
-| `sample_rate` | no (default `24000`) | Output sample rate in Hz: `16000` or `24000` |
+| `sample_rate` | no (default `24000`) | Output sample rate in Hz: `8000`, `16000`, or `24000` |
 | `audio` | no | Reference audio file for voice cloning (uploaded per request) |
 | `voice_id` | no | Pre-registered voice (see `/voices`) — clone with **no per-request upload** |
 | `language`, `speaker`, `ref_text`, `instruct`, `x_vector_only_mode` | no | Model-specific parameters |
@@ -154,7 +154,7 @@ Client → server (one JSON message per utterance):
 {"text": "Hello world", "voice_id": "my-voice", "format": "opus"}
 ```
 
-`format` is `"pcm"` (raw int16, default) or `"opus"`. Use `"audio_base64"` for a one-off reference instead of `voice_id`. Optional `"sample_rate": 16000` (or `24000`, default) resamples the native 24 kHz model output; Opus encodes at the requested rate. Send `{"type": "close"}` to end the session.
+`format` is `"pcm"` (raw int16, default) or `"opus"`. Use `"audio_base64"` for a one-off reference instead of `voice_id`. Optional `"sample_rate"` of `8000`, `16000`, or `24000` (default) resamples the native 24 kHz model output; Opus encodes at the requested rate. Send `{"type": "close"}` to end the session.
 
 **Zonos conditioning controls** (all optional, per utterance):
 
@@ -168,13 +168,15 @@ Client → server (one JSON message per utterance):
 }
 ```
 
-| field | range / format | meaning |
-| --- | --- | --- |
-| `speaking_rate` | phonemes/min (~15 normal, 30 fast, 10 slow) | speaking speed |
-| `pitch_std` | 20–45 normal, 60–150 expressive | pitch variation / expressiveness |
-| `emotion` | 8-value list `[happiness, sadness, disgust, fear, surprise, anger, other, neutral]` (auto-normalized) | emotional tone |
+| field | range / format | default | meaning |
+| --- | --- | --- | --- |
+| `speaking_rate` | phonemes/min (~15 normal, 30 fast, 10 slow) | `15` | speaking speed |
+| `pitch_std` | 20–45 normal, 60–150 expressive | `20` | pitch variation / expressiveness |
+| `emotion` | 8-value list `[happiness, sadness, disgust, fear, surprise, anger, other, neutral]` (auto-normalized) | `[0.35,0,0,0,0,0,0.15,0.5]` | emotional tone |
 
-Emotion is entangled with pitch — stronger emotion usually pairs well with a higher `pitch_std`. Unset controls keep their Zonos defaults.
+Emotion is entangled with pitch — stronger emotion usually pairs well with a higher `pitch_std`.
+
+The defaults are tuned for **call-center agents**: a clear, natural pace; steady/professional pitch; and a friendly-yet-neutral tone with no negative affect. They apply to every request (all endpoints) unless overridden. Change the global defaults via env vars: `VOX_ZONOS_SPEAKING_RATE`, `VOX_ZONOS_PITCH_STD`, `VOX_ZONOS_EMOTION` (comma-separated 8 values).
 
 Server → client, per utterance:
 
