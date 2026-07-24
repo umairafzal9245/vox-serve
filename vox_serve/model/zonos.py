@@ -610,14 +610,22 @@ class ZonosModel(BaseLM):
             _probe = torch.zeros(1, 1, _dac_frames * 512, device=self.device)
             self._output_audio_length = int(self.resample_44k_to_24k(_probe).shape[-1])
 
+        # Sampling controls. Overridable via env for tuning without code edits:
+        #   VOX_ZONOS_TEMPERATURE, VOX_ZONOS_MIN_P, VOX_ZONOS_REP_PENALTY,
+        #   VOX_ZONOS_REP_WINDOW, VOX_ZONOS_CFG_SCALE (unset/0 => CFG disabled).
+        _cfg_env = os.environ.get("VOX_ZONOS_CFG_SCALE")
+        _cfg_scale = float(_cfg_env) if _cfg_env not in (None, "", "0", "0.0") else None
         self.default_sampling_config = SamplingConfig(
             top_k=None,
             top_p=None,
-            min_p=0.1,
-            temperature=1.0,
-            repetition_penalty=3.0,
-            repetition_window=2,
-            cfg_scale=None,
+            min_p=float(os.environ.get("VOX_ZONOS_MIN_P", "0.1")),
+            # temp 0.8 + rep_penalty 1.5 (was 1.0 / 3.0): the old aggressive
+            # penalty caused periodic clicks and amplitude instability. These
+            # defaults were validated to remove pops while keeping intelligibility.
+            temperature=float(os.environ.get("VOX_ZONOS_TEMPERATURE", "0.8")),
+            repetition_penalty=float(os.environ.get("VOX_ZONOS_REP_PENALTY", "1.5")),
+            repetition_window=int(os.environ.get("VOX_ZONOS_REP_WINDOW", "2")),
+            cfg_scale=_cfg_scale,
         )
 
         self._get_default_speaker_embedding()
