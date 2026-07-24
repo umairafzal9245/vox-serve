@@ -548,8 +548,14 @@ class ZonosModel(BaseLM):
         self.config = ZonosConfig.from_dict(json.load(open(config_path)))
         self.model = ZonosForCausalLM(self.config, enable_torch_compile=self.enable_torch_compile)
         self.model.to(dtype).to(device)
-        # Initialize audio decoder on specified device (may differ from main device)
-        self.model.autoencoder.dac.to(dtype).to(self.audio_decoder_device)
+        # Initialize audio decoder on specified device (may differ from main device).
+        # The DAC vocoder is precision-sensitive: bf16 weights add audible low-level
+        # grain ("kh kh"-type roughness) to the waveform. Keep it in fp32 by default
+        # (VOX_ZONOS_DAC_FP32=0 to fall back to the LM dtype). The detok CUDA-graph
+        # output buffer is already fp32 and the input is int32, so this is graph-safe.
+        _dac_fp32 = os.environ.get("VOX_ZONOS_DAC_FP32", "1") not in ("0", "false", "False", "")
+        _dac_dtype = torch.float32 if _dac_fp32 else dtype
+        self.model.autoencoder.dac.to(_dac_dtype).to(self.audio_decoder_device)
         # Alias for naming consistency
         self.audio_decoder = self.model.autoencoder.dac
         self.speaker_encoder = ZonosSpeakerEmbeddingLDA(device=device)

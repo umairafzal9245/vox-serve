@@ -219,16 +219,30 @@ class CudaGraphWorker(ModelWorker):
             self.depth_decode_wrappers = None
             self.depth_kv_cache = None
 
+    def _log_gpu_mem(self, tag: str):
+        alloc = torch.cuda.memory_allocated(self.device) / 2**30
+        reserved = torch.cuda.memory_reserved(self.device) / 2**30
+        self.logger.info(f"[GPUMEM] {tag}: allocated={alloc:.2f}GiB reserved={reserved:.2f}GiB")
+
+    @torch.no_grad()
     def _initialize_cuda_graphs(self):
-        """Initialize CUDA graphs for different batch sizes."""
+        """Initialize CUDA graphs for different batch sizes.
+
+        Runs under ``no_grad``: the warmup forwards otherwise attach autograd graphs
+        (with saved activations) to persistent cache/KV tensors, leaking tens of GiB.
+        """
+        self._log_gpu_mem("before prefill graphs")
         self.logger.info("Initializing CUDA graphs for prefill phase...")
         self._initialize_prefill_cuda_graphs()
+        self._log_gpu_mem("after prefill graphs")
 
         self.logger.info("Initializing CUDA graphs for LM decode phase...")
         self._initialize_decode_cuda_graphs()
+        self._log_gpu_mem("after decode graphs")
 
         self.logger.info("Initializing CUDA graphs for detokenization phase...")
         self._initialize_detokenization_cuda_graphs()
+        self._log_gpu_mem("after detokenize graphs")
 
         if self.has_depth_transformer:
             if self.unroll_depth_cuda_graph:
@@ -236,6 +250,7 @@ class CudaGraphWorker(ModelWorker):
             else:
                 self.logger.info("Initializing CUDA graphs for depth transformer...")
                 self._initialize_depth_cuda_graphs()
+            self._log_gpu_mem("after depth graphs")
 
         # Inline-audio-head models (e.g. Voxtral-TTS) can opt into a captured
         # acoustic-head CUDA graph reusing this worker's graph pool.
@@ -982,6 +997,7 @@ class CudaGraphWorker(ModelWorker):
         self.logger.debug("No suitable prefill CUDA graph for batch_size %d, seq_len %d", batch_size, seq_len)
         return None
 
+    @torch.no_grad()
     def run_lm_prefill(self, requests: List[Request], lm_inputs: LMInputs) -> Optional[Coroutine]:
         """
         Override parent's run_lm_prefill to add CUDA graph optimization for prefill phase.
@@ -1130,6 +1146,7 @@ class CudaGraphWorker(ModelWorker):
 
         return task
 
+    @torch.no_grad()
     def run_lm_decode(self, requests: List[Request], lm_inputs: LMInputs) -> Optional[Coroutine]:
         """
         Override parent's run_lm_decode to add CUDA graph optimization with padding.
@@ -1250,6 +1267,7 @@ class CudaGraphWorker(ModelWorker):
 
         return task
 
+    @torch.no_grad()
     def run_lm_depth(self, output_ids, hidden_for_depth, requests, actual_batch_size, padded_batch_size):
         """
         Shared depth transformer processing logic for both prefill and decode phases.
@@ -1402,6 +1420,7 @@ class CudaGraphWorker(ModelWorker):
         self.nvtx_range_pop() # depth_transform
         return output_ids
 
+    @torch.no_grad()
     def run_detokenize(self, requests: List[Request]):
         """
         Override parent's run_detokenize to add CUDA graph optimization with padding.
@@ -1411,15 +1430,27 @@ class CudaGraphWorker(ModelWorker):
             self.nvtx_range_pop()
             return
 
-        # Prepare token_ids for multiple chunks from each request
-        token_ids = []
-        decoder_caches: List[DecoderCache] = []
-        request_chunk_mapping = []  # Track which request each chunk belongs to
+        # Chunks belonging to the SAME request must be decoded sequentially: the
+        # streaming decoder cache carries conv/attention state from one chunk to
+        # the next. Decoding a request's chunks as parallel batch rows (all seeded
+        # from the same stale cache) corrupts the first samples of every chunk
+        # after the first, producing periodic clicks at chunk joins.
+        #
+        # Process in "rounds": round r batches the r-th pending chunk of every
+        # request that still has one, so batching across requests is preserved
+        # while each request's chunks flow through its cache in order.
+        max_rounds = max(len(req.audio_decode_idx) for req in requests)
+        needs_cache = self.cuda_graph_buffers["detokenize_cache"] is not None
 
-        for req_idx, req in enumerate(requests):
-            # Process multiple chunks from the same request if available
-            for chunk_idx in range(len(req.audio_decode_idx)):
-                decode_idx = req.audio_decode_idx[chunk_idx]
+        for round_idx in range(max_rounds):
+            token_ids = []
+            decoder_caches: List[DecoderCache] = []
+            request_chunk_mapping = []  # (req_idx, chunk_idx) per batch row
+
+            for req_idx, req in enumerate(requests):
+                if round_idx >= len(req.audio_decode_idx):
+                    continue
+                decode_idx = req.audio_decode_idx[round_idx]
                 new_tokens = req.lm_output_audio_tokens[
                     decode_idx : decode_idx + self.detokenize_interval
                 ]
@@ -1429,21 +1460,40 @@ class CudaGraphWorker(ModelWorker):
 
                 token_ids.append(torch.cat(new_tokens, dim=0))
                 if req.decoder_cache is not None:
-                    # Each chunk uses the current decoder cache state of its request
                     decoder_caches.append(req.decoder_cache)
-                request_chunk_mapping.append((req_idx, chunk_idx))
+                request_chunk_mapping.append((req_idx, round_idx))
 
-        if not token_ids:
-            self.nvtx_range_pop()
-            return
+            if not token_ids:
+                continue
 
-        # The detokenization CUDA-graph buffers are sized for max_batch_size. The
-        # scheduler normally caps the number of chunks, but under heavy accumulation
-        # (e.g. small detokenize_interval) it can hand us more chunks than fit. Process
-        # in sub-batches of max_batch_size so we never overflow the fixed buffers and
-        # never drop audio, regardless of how many chunks arrive.
+            self._run_detokenize_batch(requests, token_ids, decoder_caches, request_chunk_mapping, needs_cache)
+
+        # Check if any request is completely done
+        for req in requests:
+            if req.done_lm_generation and (
+                req.audio_decode_idx[-1] + self.detokenize_interval >= len(req.lm_output_audio_tokens)
+            ):
+                req.done_all = True
+
+        self.nvtx_range_pop()
+        return
+
+    def _run_detokenize_batch(
+        self,
+        requests: List[Request],
+        token_ids: List[torch.Tensor],
+        decoder_caches: List["DecoderCache"],
+        request_chunk_mapping: List[tuple],
+        needs_cache: bool,
+    ):
+        """Decode one batch of chunks (at most one chunk per request).
+
+        The detokenization CUDA-graph buffers are sized for max_batch_size. The
+        scheduler normally caps the number of chunks, but under heavy accumulation
+        it can hand us more chunks than fit. Process in sub-batches of
+        max_batch_size so we never overflow the fixed buffers and never drop audio.
+        """
         total_chunks = len(token_ids)
-        needs_cache = self.cuda_graph_buffers["detokenize_cache"] is not None
 
         for start in range(0, total_chunks, self.max_batch_size):
             end = min(start + self.max_batch_size, total_chunks)
@@ -1532,13 +1582,3 @@ class CudaGraphWorker(ModelWorker):
 
                 audio_bytes = audio_int16.tobytes()
                 req.output_audio.put(audio_bytes)
-
-        # Check if any request is completely done
-        for req in requests:
-            if req.done_lm_generation and (
-                req.audio_decode_idx[-1] + self.detokenize_interval >= len(req.lm_output_audio_tokens)
-            ):
-                req.done_all = True
-
-        self.nvtx_range_pop() # detokenize
-        return

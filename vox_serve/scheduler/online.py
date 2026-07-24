@@ -129,9 +129,20 @@ class OnlineScheduler(Scheduler):
         if not detokenize_candidates:
             return []
 
-        # Separate critical and non-critical detokenization requests
-        critical_requests = [req for req in detokenize_candidates if req.is_pressing]
-        non_critical_requests = [req for req in detokenize_candidates if not req.is_pressing]
+        # Separate critical and non-critical detokenization requests.
+        # Requests whose LM generation has finished are always treated as critical so their
+        # remaining chunks are drained promptly. Otherwise a finished request that is not
+        # "pressing" (e.g. it generated audio faster than real-time playback) can be starved
+        # indefinitely by a steady stream of pressing requests, or skipped by the
+        # "no critical requests" early-return below, and never send its final chunk /
+        # completion message. This manifested as a small fraction of requests wedging
+        # server-side under high concurrency.
+        critical_requests = [
+            req for req in detokenize_candidates if req.is_pressing or req.done_lm_generation
+        ]
+        non_critical_requests = [
+            req for req in detokenize_candidates if not (req.is_pressing or req.done_lm_generation)
+        ]
 
         # if len(critical_requests) > 0:
         #     print(f"Critical detokenize requests: {len(critical_requests)}, "
@@ -179,6 +190,13 @@ class OnlineScheduler(Scheduler):
             # remaining = self.detokenize_max_batch_size - batch_used
             remaining = assigned_chunks[i]
             if remaining <= 0:
+                # done_all requests have zero remaining chunks but still must be
+                # selected so _send_responses sends their completion message.
+                # Skipping them here would drop them from active_requests
+                # (the done_all filter in _prepare_requests) without ever
+                # notifying the client, wedging the HTTP stream forever.
+                if req.done_all:
+                    selected_requests.append(req)
                 continue
 
             # Compute candidate indices for this req

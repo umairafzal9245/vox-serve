@@ -219,8 +219,22 @@ class Scheduler:
 
     async def _run_async_loop(self):
         task, lm_requests, detokenize_requests = None, [], []
+        last_state_dump = time.time()
         while True:
             task, lm_requests, detokenize_requests = await self._step_async(task, lm_requests, detokenize_requests)
+
+            # Periodic state dump for diagnosing stuck requests
+            now = time.time()
+            if now - last_state_dump > 5.0 and self.active_requests:
+                last_state_dump = now
+                for req in self.active_requests:
+                    n_tok = len(req.lm_output_audio_tokens) if req.lm_output_audio_tokens is not None else 0
+                    next_idx = req.next_audio_decode_idx[-1] if req.next_audio_decode_idx else -1
+                    self.logger.info(
+                        f"[STATE] {req.request_id[:8]} prefill={req.done_lm_prefill} "
+                        f"lm_done={req.done_lm_generation} all={req.done_all} "
+                        f"tokens={n_tok} next_idx={next_idx} pressing={req.is_pressing}"
+                    )
             await asyncio.sleep(0)
 
     def run_forever(self):
@@ -434,7 +448,7 @@ class Scheduler:
             if cfg_alpha is not None:
                 new_request.sampling_config = SamplingConfig(cfg_scale=float(cfg_alpha))
 
-            self.logger.debug("new_request=%s", new_request)
+            self.logger.info(f"[ADMIT] {new_request.request_id[:8]}")
             return new_request
         else:
             self.logger.warning(f"Received malformed audio message: {message_payload[:50]}...")

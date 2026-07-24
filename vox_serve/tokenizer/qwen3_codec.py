@@ -1780,7 +1780,12 @@ class Qwen3TTSDecoder(nn.Module):
         self.model.load_state_dict(state_dict, strict=False)
         self.model.to(device=device, dtype=dtype)
         self.model.eval()
+        # Inference-only: without this, any forward outside a no_grad context builds
+        # autograd graphs (params require grad by default), leaking activations that
+        # stay attached to the persistent streaming caches.
+        self.model.requires_grad_(False)
 
+    @torch.no_grad()
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
         """
         Decode discrete tokens to audio waveform.
@@ -1821,12 +1826,18 @@ class Qwen3TTSDecoder(nn.Module):
             device = self.device
         return self.model.decoder.init_cache(batch_size, device, dtype, detokenize_interval)
 
+    @torch.no_grad()
     def decode_chunk(
         self,
         codes: torch.Tensor,
         decoder_cache: Optional[Qwen3TTSDecoderCache] = None,
     ) -> Tuple[torch.Tensor, Qwen3TTSDecoderCache]:
         """Decode a chunk of tokens with caching for streaming inference.
+
+        NOTE: ``@torch.no_grad()`` is load-bearing here. The decoder performs in-place
+        updates on persistent cache tensors; with autograd enabled, each call attaches
+        a full autograd graph (with saved activations, ~3.7 GiB per call at batch 16)
+        to the cache, which is never freed and rapidly OOMs the GPU.
 
         Args:
             codes: Tensor of shape (batch_size, num_quantizers, chunk_length)
@@ -1839,6 +1850,7 @@ class Qwen3TTSDecoder(nn.Module):
         audio_values, new_cache = self.model.decoder.forward_chunk(codes, decoder_cache)
         return audio_values, new_cache
 
+    @torch.no_grad()
     def encode(
         self,
         input_values: torch.Tensor,

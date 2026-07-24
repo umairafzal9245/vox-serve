@@ -25,5 +25,10 @@ class DAC:
         return self.dac.encode(wav).audio_codes
 
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
-        with torch.autocast(self.dac.device.type, torch.float16, enabled=self.dac.device.type != "cpu"):
+        # When the DAC runs in fp32 (for quality), decode in full fp32 — an fp16
+        # autocast would defeat the point by downcasting the conv/matmul ops. When
+        # the DAC is in a reduced dtype, keep the fp16 autocast as before.
+        param_dtype = next(self.dac.parameters()).dtype
+        use_autocast = self.dac.device.type != "cpu" and param_dtype != torch.float32
+        with torch.autocast(self.dac.device.type, torch.float16, enabled=use_autocast):
             return self.dac.decode(audio_codes=codes).audio_values.unsqueeze(1).float()

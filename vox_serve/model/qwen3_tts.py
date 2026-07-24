@@ -1,4 +1,6 @@
 import json
+import os
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1062,6 +1064,9 @@ class Qwen3TTSModel(BaseLMWithDepth):
             model_name = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
         super().__init__(model_name, device, dtype, enable_torch_compile, audio_decoder_device)
         self.logger = get_logger(__name__)
+        # LRU cache of processed reference audio: (path, size, mtime, xvec_mode)
+        # -> (speaker_embedding, ref_codes)
+        self._ref_audio_cache: "OrderedDict[tuple, tuple]" = OrderedDict()
         self.model_name = model_name
 
         config_path = hf_hub_download(
@@ -1124,6 +1129,10 @@ class Qwen3TTSModel(BaseLMWithDepth):
             self.model.load_state_dict(state_dict, strict=False)
 
         self.model.to(dtype).to(device)
+        # Inference-only: prevent autograd graph accumulation on persistent caches/KV
+        # when forwards run outside a no_grad context.
+        self.model.requires_grad_(False)
+        self.model.eval()
 
         # Sync the lm_head_weight buffer with the loaded weights for CUDA graph compatibility
         # The buffer is created at __init__ with random weights, so we need to update it
@@ -1579,8 +1588,10 @@ class Qwen3TTSModel(BaseLMWithDepth):
         ref_text_ids = None
 
         if is_voice_clone_mode:
-            # Voice cloning mode
-            if audio_path is None or ref_text is None:
+            # Voice cloning mode.
+            # ICL mode needs both audio_path and ref_text. x_vector_only_mode only needs
+            # the reference audio (speaker embedding), so ref_text is optional there.
+            if audio_path is None or (ref_text is None and not x_vector_only_mode):
                 self.logger.warning(
                     "You need to provide both audio_path and ref_text for voice cloning mode. "
                     "Using default audio and text. "
@@ -1597,26 +1608,48 @@ class Qwen3TTSModel(BaseLMWithDepth):
                     "But you know what? You blew it! And thanks to you."
                 )
 
-            audio, sr = self._load_audio_to_np(audio_path)
+            # Cache reference-audio processing by file identity: under concurrency
+            # many requests share the same registered voice, and re-running
+            # librosa load/resample + speaker encoder per request serializes in
+            # the scheduler loop and inflates time-to-first-audio.
+            try:
+                stat = os.stat(audio_path)
+                cache_key = (audio_path, stat.st_size, stat.st_mtime_ns, x_vector_only_mode)
+            except OSError:
+                cache_key = None
 
-            # Extract speaker embedding (resample to 24kHz if needed)
-            if sr != self.speaker_encoder_sample_rate:
-                audio_resampled = librosa.resample(
-                    y=audio.astype(np.float32),
-                    orig_sr=int(sr),
-                    target_sr=self.speaker_encoder_sample_rate
-                )
+            cached = self._ref_audio_cache.get(cache_key) if cache_key is not None else None
+            if cached is not None:
+                spk_embedding, ref_codes = cached
+                self._ref_audio_cache.move_to_end(cache_key)
             else:
-                audio_resampled = audio
+                audio, sr = self._load_audio_to_np(audio_path)
 
-            spk_embedding = self._extract_speaker_embedding(
-                audio=audio_resampled,
-                sr=self.speaker_encoder_sample_rate
-            )
+                # Extract speaker embedding (resample to 24kHz if needed)
+                if sr != self.speaker_encoder_sample_rate:
+                    audio_resampled = librosa.resample(
+                        y=audio.astype(np.float32),
+                        orig_sr=int(sr),
+                        target_sr=self.speaker_encoder_sample_rate
+                    )
+                else:
+                    audio_resampled = audio
 
-            # Extract reference codes for ICL mode (unless x_vector_only_mode)
+                spk_embedding = self._extract_speaker_embedding(
+                    audio=audio_resampled,
+                    sr=self.speaker_encoder_sample_rate
+                )
+
+                # Extract reference codes for ICL mode (unless x_vector_only_mode)
+                if not x_vector_only_mode:
+                    ref_codes = self._encode_audio_to_codes(audio, sr)
+
+                if cache_key is not None:
+                    self._ref_audio_cache[cache_key] = (spk_embedding, ref_codes)
+                    while len(self._ref_audio_cache) > 64:
+                        self._ref_audio_cache.popitem(last=False)
+
             if not x_vector_only_mode:
-                ref_codes = self._encode_audio_to_codes(audio, sr)
 
                 # Tokenize reference text
                 ref_text_tpl = "<|im_start|>assistant\n{text}<|im_end|>\n"

@@ -264,10 +264,16 @@ class ModelWorker:
                 model_kwargs = req.model_kwargs.copy()
                 if req.is_input_streaming:
                     model_kwargs["is_input_streaming"] = True
-                # Filter kwargs to only those accepted by preprocess
+                # Filter kwargs to only those accepted by preprocess.
+                # If preprocess declares **kwargs (VAR_KEYWORD), keep all model_kwargs so
+                # model-specific params (e.g. x_vector_only_mode, ref_text) are not dropped.
                 import inspect
                 sig_params = inspect.signature(self.model.preprocess).parameters
-                model_kwargs = {k: v for k, v in model_kwargs.items() if k in sig_params}
+                accepts_var_kw = any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in sig_params.values()
+                )
+                if not accepts_var_kw:
+                    model_kwargs = {k: v for k, v in model_kwargs.items() if k in sig_params}
                 preprocess_output = self.model.preprocess(
                     prompt=req.prompt,
                     audio_path=req.audio_path,
@@ -408,6 +414,7 @@ class ModelWorker:
             elif hasattr(self.model, "config") and hasattr(self.model.config, "tts_pad_token_id"):
                 req.input_tokens[0, -1] = self.model.config.tts_pad_token_id
 
+    @torch.no_grad()
     def run_lm_prefill(self, requests: List[Request], lm_inputs: LMInputs) -> Optional[Coroutine]:
         if len(requests) == 0:
             return None
@@ -487,6 +494,7 @@ class ModelWorker:
 
             return task
 
+    @torch.no_grad()
     def run_lm_decode(self, requests: List[Request], lm_inputs: LMInputs) -> Optional[Coroutine]:
         """
         Run LM decode step for the given requests.
@@ -558,6 +566,7 @@ class ModelWorker:
 
             return task
 
+    @torch.no_grad()
     def run_lm_depth(
         self,
         output_ids: torch.Tensor,
@@ -628,6 +637,7 @@ class ModelWorker:
 
         return output_ids
 
+    @torch.no_grad()
     def run_detokenize(self, requests: List[Request]):
         if len(requests) == 0:
             return
@@ -701,6 +711,7 @@ class ModelWorker:
 
         return
 
+    @torch.no_grad()
     def run_watermark(self, audio_tensor: torch.Tensor, orig_sr: int = 24000):
         """
         Run watermarking on the given audio array.
