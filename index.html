@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>VoxServe TTS Tester</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --border: #2a2f3a;
+    --text: #e8e9ec;
+    --muted: #9aa1ac;
+    --accent: #6c5ce7;
+    --accent-hover: #5a4bd1;
+    --error: #ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    display: flex;
+    justify-content: center;
+    padding: 40px 16px;
+  }
+  .card {
+    width: 100%;
+    max-width: 640px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 28px 28px 32px;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  p.subtitle {
+    color: var(--muted);
+    margin: 0 0 24px;
+    font-size: 13px;
+  }
+  label {
+    display: block;
+    font-size: 13px;
+    color: var(--muted);
+    margin-bottom: 6px;
+    margin-top: 18px;
+  }
+  textarea, select, input[type="text"] {
+    width: 100%;
+    background: #0f1115;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 14px;
+    resize: vertical;
+    font-family: inherit;
+  }
+  textarea:focus, select:focus, input:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  .row { display: flex; gap: 16px; }
+  .row > div { flex: 1; }
+  button#generateBtn {
+    margin-top: 24px;
+    width: 100%;
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    padding: 12px 16px;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s ease;
+  }
+  button#generateBtn:hover:not(:disabled) { background: var(--accent-hover); }
+  button#generateBtn:disabled { opacity: 0.6; cursor: not-allowed; }
+  .status { margin-top: 14px; font-size: 13px; min-height: 18px; }
+  .status.error { color: var(--error); }
+  .status.info { color: var(--muted); }
+  .status.success { color: #55e39a; }
+  .player { margin-top: 20px; display: none; }
+  .player audio { width: 100%; }
+  .player a {
+    display: inline-block;
+    margin-top: 10px;
+    color: var(--accent);
+    font-size: 13px;
+    text-decoration: none;
+  }
+  .player a:hover { text-decoration: underline; }
+  .log-panel { margin-top: 18px; }
+  .log-panel summary {
+    cursor: pointer;
+    color: var(--muted);
+    font-size: 13px;
+    user-select: none;
+  }
+  #log {
+    margin-top: 8px;
+    background: #0b0d11;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-family: "SF Mono", Consolas, Menlo, monospace;
+    font-size: 12px;
+    color: var(--muted);
+    max-height: 220px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .spinner {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    border: 2px solid rgba(255,255,255,0.4);
+    border-top-color: #fff;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    vertical-align: middle;
+    margin-right: 8px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>VoxServe TTS Tester</h1>
+    <p class="subtitle">
+      Streams speech over WebSocket <code>/ws</code> (PCM int16 mono).
+      HTTP <code>/generate</code> is disabled.
+    </p>
+
+    <div>
+      <label for="serverUrl">Server URL</label>
+      <input type="text" id="serverUrl" value="http://178.63.124.87:2200" />
+      <div class="hint">HTTP base URL — the page converts it to <code>ws://…/ws</code>.</div>
+    </div>
+
+    <label for="text">Text</label>
+    <textarea id="text" rows="4">Hello from VoxServe. This is an eight kilohertz telephony sample.</textarea>
+
+    <div class="row">
+      <div>
+        <label for="voice">Voice</label>
+        <select id="voice"></select>
+      </div>
+      <div>
+        <label for="sampleRate">Sample rate</label>
+        <select id="sampleRate">
+          <option value="8000" selected>8000 Hz (telephony)</option>
+          <option value="16000">16000 Hz</option>
+          <option value="24000">24000 Hz (native)</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="row">
+      <div>
+        <label for="format">Format</label>
+        <select id="format">
+          <option value="pcm" selected>PCM (int16 LE)</option>
+          <option value="opus">Opus (20 ms packets)</option>
+        </select>
+      </div>
+      <div>
+        <label for="xVector">Clone mode</label>
+        <select id="xVector">
+          <option value="true" selected>x_vector_only (voice_id)</option>
+        </select>
+      </div>
+    </div>
+
+    <button id="generateBtn">Generate</button>
+    <div id="status" class="status"></div>
+
+    <div id="player" class="player">
+      <audio id="audio" controls></audio>
+      <br />
+      <a id="downloadLink" download="voxserve.wav">Download .wav</a>
+    </div>
+
+    <details class="log-panel" open>
+      <summary>Debug log</summary>
+      <div id="log"></div>
+    </details>
+  </div>
+
+  <script>
+    // VoxServe /ws protocol:
+    //   client -> { text, voice_id, sample_rate, format, x_vector_only_mode }
+    //   server -> { type: "start", sample_rate, channels, format, frame_ms? }
+    //   server -> binary frames (PCM chunks ~400ms, or Opus 20ms packets)
+    //   server -> { type: "end" } | { type: "error", detail }
+
+    const FALLBACK_VOICES = [
+      "Bella_vox", "Chloe_vox", "Cole_vox", "Ethan_vox", "Finn_vox", "Ivy_vox",
+      "Jake_vox", "Leo_vox", "Lily_vox", "Max_vox", "Nova_vox", "Ruby_vox",
+      "Ryan_vox", "Skye_vox", "Zane_vox", "Zoe_vox", "james-pk", "laura",
+    ];
+
+    const els = {
+      serverUrl: document.getElementById("serverUrl"),
+      text: document.getElementById("text"),
+      voice: document.getElementById("voice"),
+      sampleRate: document.getElementById("sampleRate"),
+      format: document.getElementById("format"),
+      generateBtn: document.getElementById("generateBtn"),
+      status: document.getElementById("status"),
+      player: document.getElementById("player"),
+      audio: document.getElementById("audio"),
+      downloadLink: document.getElementById("downloadLink"),
+      log: document.getElementById("log"),
+    };
+
+    let currentObjectUrl = null;
+    let activeSocket = null;
+
+    function setStatus(message, type = "info") {
+      els.status.textContent = message;
+      els.status.className = `status ${type}`;
+    }
+
+    function setLoading(isLoading) {
+      els.generateBtn.disabled = isLoading;
+      els.generateBtn.innerHTML = isLoading
+        ? '<span class="spinner"></span>Generating...'
+        : "Generate";
+    }
+
+    function log(message) {
+      const time = new Date().toLocaleTimeString();
+      els.log.textContent += `[${time}] ${message}\n`;
+      els.log.scrollTop = els.log.scrollHeight;
+    }
+
+    function clearLog() {
+      els.log.textContent = "";
+    }
+
+    function toWebSocketUrl(baseUrl) {
+      const url = new URL(baseUrl);
+      url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+      url.pathname = "/ws";
+      url.search = "";
+      url.hash = "";
+      return url.toString();
+    }
+
+    function httpBase(baseUrl) {
+      const url = new URL(baseUrl);
+      url.pathname = "";
+      url.search = "";
+      url.hash = "";
+      return url.toString().replace(/\/$/, "");
+    }
+
+    function populateVoices(voices) {
+      const list = voices && voices.length ? voices : FALLBACK_VOICES;
+      els.voice.innerHTML = "";
+      for (const voice of list) {
+        const opt = document.createElement("option");
+        opt.value = voice;
+        opt.textContent = voice;
+        els.voice.appendChild(opt);
+      }
+      if (list.includes("laura")) els.voice.value = "laura";
+      else if (list.includes("james-pk")) els.voice.value = "james-pk";
+    }
+
+    async function refreshVoices() {
+      try {
+        const base = httpBase(els.serverUrl.value.trim());
+        const res = await fetch(`${base}/voices`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        const voices = data.voices || data || [];
+        populateVoices(voices);
+        log(`Loaded ${voices.length} voices from ${base}/voices`);
+      } catch (err) {
+        populateVoices(FALLBACK_VOICES);
+        log(`Could not load /voices (${err.message}); using fallback list.`);
+      }
+    }
+
+    function concatUint8Arrays(chunks) {
+      const total = chunks.reduce((sum, c) => sum + c.length, 0);
+      const result = new Uint8Array(total);
+      let offset = 0;
+      for (const c of chunks) {
+        result.set(c, offset);
+        offset += c.length;
+      }
+      return result;
+    }
+
+    function writeAscii(view, offset, str) {
+      for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+    }
+
+    function wrapPcmAsWav(pcmBytes, sampleRate) {
+      const dataLength = pcmBytes.length;
+      const buffer = new ArrayBuffer(44);
+      const view = new DataView(buffer);
+      const numChannels = 1;
+      const bitsPerSample = 16;
+      const blockAlign = numChannels * (bitsPerSample / 8);
+      const byteRate = sampleRate * blockAlign;
+
+      writeAscii(view, 0, "RIFF");
+      view.setUint32(4, 36 + dataLength, true);
+      writeAscii(view, 8, "WAVE");
+      writeAscii(view, 12, "fmt ");
+      view.setUint32(16, 16, true);
+      view.setUint16(20, 1, true);
+      view.setUint16(22, numChannels, true);
+      view.setUint32(24, sampleRate, true);
+      view.setUint32(28, byteRate, true);
+      view.setUint16(32, blockAlign, true);
+      view.setUint16(34, bitsPerSample, true);
+      writeAscii(view, 36, "data");
+      view.setUint32(40, dataLength, true);
+
+      const out = new Uint8Array(44 + dataLength);
+      out.set(new Uint8Array(buffer), 0);
+      out.set(pcmBytes, 44);
+      return out;
+    }
+
+    function showWav(wavBytes, filename) {
+      const blob = new Blob([wavBytes], { type: "audio/wav" });
+      if (currentObjectUrl) URL.revokeObjectURL(currentObjectUrl);
+      currentObjectUrl = URL.createObjectURL(blob);
+      els.audio.src = currentObjectUrl;
+      els.downloadLink.href = currentObjectUrl;
+      els.downloadLink.download = filename || "voxserve.wav";
+      els.player.style.display = "block";
+      els.audio.play().catch(() => {});
+      return blob;
+    }
+
+    async function decodeOpusPackets(packets, sampleRate) {
+      // Prefer WebCodecs AudioDecoder when available; otherwise fall back to
+      // collecting packets into an Ogg container is complex — show a clear error.
+      if (typeof AudioDecoder === "undefined") {
+        throw new Error(
+          "Opus playback needs WebCodecs AudioDecoder (Chrome/Edge). Switch Format to PCM."
+        );
+      }
+
+      const floatChunks = [];
+      let channels = 1;
+      let outRate = sampleRate;
+
+      await new Promise((resolve, reject) => {
+        const decoder = new AudioDecoder({
+          output: (audioData) => {
+            channels = audioData.numberOfChannels;
+            outRate = audioData.sampleRate;
+            const copy = new Float32Array(audioData.numberOfFrames * channels);
+            // de-interleave later; gather per-channel
+            const perCh = [];
+            for (let c = 0; c < channels; c++) {
+              const buf = new Float32Array(audioData.numberOfFrames);
+              audioData.copyTo(buf, { planeIndex: c });
+              perCh.push(buf);
+            }
+            floatChunks.push(perCh);
+            audioData.close();
+          },
+          error: (e) => reject(e),
+        });
+
+        decoder.configure({
+          codec: "opus",
+          sampleRate,
+          numberOfChannels: 1,
+        });
+
+        let ts = 0;
+        const frameUs = 20_000; // 20 ms
+        for (const pkt of packets) {
+          decoder.decode(new EncodedAudioChunk({
+            type: "key",
+            timestamp: ts,
+            duration: frameUs,
+            data: pkt,
+          }));
+          ts += frameUs;
+        }
+        decoder.flush().then(() => {
+          decoder.close();
+          resolve();
+        }).catch(reject);
+      });
+
+      if (!floatChunks.length) throw new Error("No Opus audio decoded.");
+
+      const frames = floatChunks.reduce((n, chs) => n + chs[0].length, 0);
+      const pcm = new Int16Array(frames);
+      let off = 0;
+      for (const chs of floatChunks) {
+        const left = chs[0];
+        for (let i = 0; i < left.length; i++) {
+          const s = Math.max(-1, Math.min(1, left[i]));
+          pcm[off++] = s < 0 ? s * 0x8000 : s * 0x7fff;
+        }
+      }
+      return wrapPcmAsWav(new Uint8Array(pcm.buffer), outRate);
+    }
+
+    function generate() {
+      const serverUrl = els.serverUrl.value.trim();
+      const text = els.text.value.trim();
+      const voiceId = els.voice.value;
+      const sampleRate = Number(els.sampleRate.value);
+      const format = els.format.value;
+
+      if (!serverUrl) return setStatus("Please enter a server URL.", "error");
+      if (!text) return setStatus("Please enter some text.", "error");
+
+      let wsUrl;
+      try {
+        wsUrl = toWebSocketUrl(serverUrl);
+      } catch (err) {
+        return setStatus(`Invalid server URL: ${err.message}`, "error");
+      }
+
+      if (activeSocket) {
+        activeSocket.close();
+        activeSocket = null;
+      }
+
+      clearLog();
+      els.player.style.display = "none";
+      setLoading(true);
+      setStatus(`Connecting to ${wsUrl} ...`, "info");
+      log(`Connecting to ${wsUrl}`);
+
+      const chunks = [];
+      let finalized = false;
+      let streamSampleRate = sampleRate;
+      let streamFormat = format;
+      let t0 = 0;
+      let ttfaMs = null;
+      let requestId = null;
+
+      let socket;
+      try {
+        socket = new WebSocket(wsUrl);
+      } catch (err) {
+        setLoading(false);
+        return setStatus(`Failed to open WebSocket: ${err.message}`, "error");
+      }
+      socket.binaryType = "arraybuffer";
+      activeSocket = socket;
+
+      const finish = async (ok) => {
+        if (finalized) return;
+        finalized = true;
+        setLoading(false);
+
+        if (!ok || chunks.length === 0) {
+          if (!els.status.className.includes("error")) {
+            setStatus("No audio received.", "error");
+          }
+          return;
+        }
+
+        try {
+          let wavBytes;
+          if (streamFormat === "opus") {
+            log(`Decoding ${chunks.length} Opus packets...`);
+            wavBytes = await decodeOpusPackets(chunks, streamSampleRate);
+          } else {
+            const pcm = concatUint8Arrays(chunks);
+            log(`Wrapping ${pcm.length} bytes PCM as WAV @ ${streamSampleRate} Hz`);
+            wavBytes = wrapPcmAsWav(pcm, streamSampleRate);
+          }
+
+          const blob = showWav(wavBytes, `${voiceId}_${streamSampleRate}.wav`);
+          const totalMs = Math.round(performance.now() - t0);
+          const msg = [
+            `Done — ${(blob.size / 1024).toFixed(1)} KB`,
+            ttfaMs != null ? `TTFA ${ttfaMs} ms` : null,
+            `total ${totalMs} ms`,
+            `${chunks.length} frames`,
+          ].filter(Boolean).join(" · ");
+          setStatus(msg, "success");
+          log(msg);
+        } catch (err) {
+          console.error(err);
+          log(`Audio process error: ${err.message}`);
+          setStatus(`Failed to process audio: ${err.message}`, "error");
+        }
+      };
+
+      socket.addEventListener("open", () => {
+        t0 = performance.now();
+        setStatus("Connected. Requesting audio...", "info");
+        const payload = {
+          text,
+          voice_id: voiceId,
+          sample_rate: sampleRate,
+          format,
+          x_vector_only_mode: true,
+        };
+        socket.send(JSON.stringify(payload));
+        log(`Sent: ${JSON.stringify(payload)}`);
+      });
+
+      socket.addEventListener("message", (event) => {
+        if (event.data instanceof ArrayBuffer) {
+          if (ttfaMs == null) {
+            ttfaMs = Math.round(performance.now() - t0);
+            setStatus(`First audio in ${ttfaMs} ms… streaming`, "info");
+            log(`TTFA ${ttfaMs} ms`);
+          }
+          chunks.push(new Uint8Array(event.data));
+          log(`binary ${event.data.byteLength} B (n=${chunks.length})`);
+          return;
+        }
+
+        if (typeof event.data !== "string") return;
+        log(`text: ${event.data}`);
+
+        let msg;
+        try { msg = JSON.parse(event.data); } catch { return; }
+
+        const type = (msg.type || msg.event || msg.status || "").toLowerCase();
+
+        if (type === "start") {
+          requestId = msg.request_id || null;
+          streamSampleRate = msg.sample_rate || sampleRate;
+          streamFormat = msg.format === "opus" ? "opus" : "pcm";
+          log(`start request_id=${requestId} sr=${streamSampleRate} format=${msg.format}`);
+          return;
+        }
+
+        if (type === "error") {
+          const detail = msg.detail || msg.error || JSON.stringify(msg);
+          setStatus(`Server error: ${detail}`, "error");
+          finalized = true;
+          setLoading(false);
+          socket.close();
+          return;
+        }
+
+        if (["end", "done", "complete", "completed", "finished"].includes(type)) {
+          finish(true).then(() => socket.close());
+        }
+      });
+
+      socket.addEventListener("error", () => {
+        log("WebSocket error event");
+        setStatus(
+          "WebSocket error — check server URL/port and CORS/firewall.",
+          "error"
+        );
+      });
+
+      socket.addEventListener("close", (event) => {
+        log(`closed code=${event.code}${event.reason ? ` reason=${event.reason}` : ""}`);
+        activeSocket = null;
+        if (!finalized) finish(chunks.length > 0);
+      });
+    }
+
+    els.generateBtn.addEventListener("click", generate);
+    els.serverUrl.addEventListener("change", refreshVoices);
+
+    populateVoices(FALLBACK_VOICES);
+    refreshVoices();
+  </script>
+</body>
+</html>

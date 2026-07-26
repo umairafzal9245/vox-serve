@@ -851,6 +851,11 @@ async def generate(
     Returns:
         Audio file as direct response (if streaming=False) or streaming audio response (if streaming=True)
     """
+    raise HTTPException(
+        status_code=410,
+        detail="/generate is disabled. Use WebSocket /ws for synthesis.",
+    )
+
     if api_server is None:
         raise HTTPException(status_code=503, detail="Server not ready")
 
