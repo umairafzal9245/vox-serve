@@ -3,58 +3,72 @@
 ## Prerequisites
 
 - Linux host with NVIDIA GPU
-- [Docker](https://docs.docker.com/get-docker/) + [Compose v2](https://docs.docker.com/compose/)
+- Docker Engine + Compose v2
 - [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)
-
-Verify GPU passthrough:
 
 ```bash
 docker run --rm --gpus all nvidia/cuda:12.8.1-base-ubuntu24.04 nvidia-smi
 ```
 
-## Start
+## Start (build + run)
 
 ```bash
 git clone https://github.com/reactivespace/Qwen3-TTS.git
 cd Qwen3-TTS
+
+# Optional: reuse your existing Hugging Face cache during build (much faster)
+export HF_CACHE_HOST="$HOME/.cache/huggingface"
+
 docker compose up -d --build
 ```
 
-First boot downloads the Hugging Face model into a Docker volume (can take several minutes).
-
-## Check
+Model weights are **baked into the image at build time** (copied from `HF_CACHE_HOST` if present, otherwise downloaded from Hugging Face).
 
 ```bash
 curl http://localhost:2200/health
 curl http://localhost:2200/stats
-curl http://localhost:2200/voices
 ```
 
-WebSocket TTS: `ws://HOST:2200/ws`  
-Browser tester: open `index.html` and point at `http://HOST:2200`
+## What is `docker-compose.override.yml`?
 
-## Logs (persistent)
+Compose **auto-merges** a file named `docker-compose.override.yml` next to `docker-compose.yml` when you run `docker compose up`.
 
-Inside the container / volume:
+| File | Purpose |
+|------|---------|
+| `docker-compose.yml` | Shared / committed config for everyone |
+| `docker-compose.override.yml` | **Local-only** tweaks (extra volume mounts, debug ports). Not committed. |
 
-- `/var/log/vox-serve/requests.jsonl`
-- `/var/log/vox-serve/stats.json`
-- `/var/log/vox-serve/stats.log`
-- `/var/log/vox-serve/server.log` (compose stdout also via `docker compose logs -f`)
+Example local override:
 
-```bash
-docker compose logs -f qwen3-tts
-docker compose exec qwen3-tts cat /var/log/vox-serve/stats.json
+```yaml
+services:
+  qwen3-tts:
+    environment:
+      LOG_LEVEL: DEBUG
 ```
+
+You do **not** need an override file for normal deploy. If it exists, Compose applies it automatically — that can surprise you (e.g. mounting an empty host folder over `/data/hf-cache` would hide the baked-in model).
 
 ## Configure
 
-Copy `.env.example` → `.env` and set e.g.:
+Copy `.env.example` → `.env`:
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `HF_CACHE_HOST` | `./docker/empty-hf` | Host HF cache used **during build** |
+| `HF_TOKEN` | — | Token for gated / rate-limited Hub access |
+| `MODEL` | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | Model id |
+| `MAX_BATCH_SIZE` | `64` | Concurrent decode batch |
+| `PORT` | `2200` | Host port |
+
+## Logs
+
+Host path `/var/log/vox-serve` is mounted into the container:
 
 ```bash
-HF_TOKEN=hf_...          # if the model gated / rate-limited
-MAX_BATCH_SIZE=32        # lower if GPU OOM
-NVIDIA_VISIBLE_DEVICES=0
+docker compose logs -f qwen3-tts
+curl http://localhost:2200/stats
+ls /var/log/vox-serve/
 ```
 
 ## Stop
@@ -62,5 +76,3 @@ NVIDIA_VISIBLE_DEVICES=0
 ```bash
 docker compose down
 ```
-
-Volumes (`hf_cache`, `vox_logs`, `vox_voices`) keep models and metrics unless you run `docker compose down -v`.

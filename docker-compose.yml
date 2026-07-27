@@ -2,10 +2,8 @@
 #
 #   docker compose up -d --build
 #
-# API:      http://HOST:2200
-# Health:   http://HOST:2200/health
-# Stats:    http://HOST:2200/stats
-# WebSocket http://HOST:2200/ws
+# Model weights are downloaded (or copied from host HF cache) DURING IMAGE BUILD.
+# Do not mount an empty volume over /data/hf-cache or you will hide the baked model.
 #
 # Requires NVIDIA GPU + nvidia-container-toolkit on the host.
 
@@ -14,6 +12,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      additional_contexts:
+        # Slim host cache (run ./docker/prepare_hf_cache.sh) or empty → Hub download
+        hfcache: ${HF_CACHE_HOST:-./docker/empty-hf}
+      args:
+        MODEL: ${MODEL:-Qwen/Qwen3-TTS-12Hz-1.7B-Base}
+        HF_TOKEN: ${HF_TOKEN:-}
     image: reactivespace/qwen3-tts:latest
     container_name: qwen3-tts
     restart: unless-stopped
@@ -32,37 +36,29 @@ services:
       VOX_METRICS_DIR: /var/log/vox-serve
       VOX_OUTPUT_DIR: /data/voices
       HF_HOME: /data/hf-cache
+      TRANSFORMERS_CACHE: /data/hf-cache
+      HUGGINGFACE_HUB_CACHE: /data/hf-cache
       HF_TOKEN: ${HF_TOKEN:-}
       HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
       NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
     volumes:
-      # Persist model weights across restarts (large; first boot downloads ~few GB)
-      - hf_cache:/data/hf-cache
-      # Permanent metrics + server logs
-      - vox_logs:/var/log/vox-serve
-      # Optional: mount host voices / registered refs if you manage them outside
+      # Permanent metrics + server logs (host path)
+      - /var/log/vox-serve:/var/log/vox-serve
+      # Registered voices persist on a named volume
       - vox_voices:/data/voices
     shm_size: "8gb"
     ulimits:
       memlock: -1
       stack: 67108864
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+    gpus: all
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:2200/health"]
       interval: 30s
       timeout: 5s
       retries: 5
-      start_period: 300s
+      start_period: 180s
 
 volumes:
-  hf_cache:
-  vox_logs:
   vox_voices:

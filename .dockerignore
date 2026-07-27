@@ -27,3 +27,6 @@ ttsServiceVoxServe.js
 index.html
 *.log
 .DS_Store
+docker/hf-cache-build
+docker-compose.override.yml
+.env

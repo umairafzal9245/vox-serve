@@ -21,10 +21,16 @@ Optimized for call-center / real-time voice agents: WebSocket streaming, voice c
 ```bash
 git clone https://github.com/reactivespace/Qwen3-TTS.git
 cd Qwen3-TTS
+
+# Optional but recommended: reuse a local Hugging Face cache during image build
+export HF_CACHE_HOST="$HOME/.cache/huggingface"
+
 docker compose up -d --build
 ```
 
-First boot downloads model weights into a Docker volume (several minutes). Then:
+Model weights are downloaded (or copied from `HF_CACHE_HOST`) **while the image builds**, so the container starts without a cold Hub download.
+
+First build can take a while (PyTorch + model). Then:
 
 ```bash
 curl http://localhost:2200/health

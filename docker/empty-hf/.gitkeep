@@ -1,0 +1,4 @@
+# Empty HF cache placeholder so builds work without a host cache.
+# Compose sets additional_contexts.hfcache to $HOME/.cache/huggingface when present,
+# otherwise this directory (download from Hub during build).
+.gitkeep

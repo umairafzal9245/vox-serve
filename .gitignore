@@ -183,3 +183,4 @@ cython_debug/
 # local docker overrides
 docker-compose.override.yml
 .env
+docker/hf-cache-build/
