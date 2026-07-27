@@ -1738,6 +1738,12 @@ def main():
         action="store_true",
         help="Unroll all depth transformer iterations into a single CUDA graph for reduced overhead (default: False)",
     )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=os.environ.get("VOX_OUTPUT_DIR", "/tmp/vox_serve_audio"),
+        help="Directory for uploads, registered voices, and non-streaming audio (default: /tmp/vox_serve_audio or VOX_OUTPUT_DIR)",
+    )
     args = parser.parse_args()
 
     # Set global log level for the entire application
@@ -1793,6 +1799,7 @@ def main():
         scheduler_type=scheduler_type,
         request_socket_path=request_socket_path,
         result_socket_path=result_socket_path,
+        output_dir=args.output_dir,
         max_batch_size=args.max_batch_size,
         max_num_pages=args.max_num_pages,
         page_size=args.page_size,
