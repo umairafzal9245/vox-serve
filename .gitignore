@@ -179,3 +179,7 @@ cython_debug/
 # audio files 
 *.wav
 *.mp3
+
+# local docker overrides
+docker-compose.override.yml
+.env

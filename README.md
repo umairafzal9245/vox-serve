@@ -1,261 +1,187 @@
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/_static/images/logo-dark.png">
-    <source media="(prefers-color-scheme: light)" srcset="docs/_static/images/logo-light.png">
-    <img src="docs/_static/images/logo-dark.png" alt="VoxServe Logo" width="320" />
-  </picture>
-</p>
+# Qwen3-TTS
 
-<h1 align="center">VoxServe</h1>
-<p align="center"><strong>A High-Performance Serving System for Speech Language Models</strong></p>
+High-performance streaming TTS server for **[Qwen3-TTS](https://huggingface.co/collections/Qwen/qwen3-tts)**, built on [VoxServe](https://github.com/vox-serve/vox-serve).
 
-<p align="center">
-  <a href="https://pypi.org/project/vox-serve/"><img src="https://img.shields.io/pypi/v/vox-serve?style=for-the-badge&logo=pypi&logoColor=white&label=PyPI&color=3775A9" alt="PyPI"></a>
-  <a href="https://arxiv.org/abs/2602.00269"><img src="https://img.shields.io/badge/arXiv-2602.00269-B31B1B?style=for-the-badge&logo=arxiv&logoColor=white" alt="arXiv"></a>
-  <a href="https://vox-serve.github.io/vox-serve/"><img src="https://img.shields.io/badge/docs-online-009688?style=for-the-badge&logo=readthedocs&logoColor=white" alt="Documentation"></a>
-</p>
+Optimized for call-center / real-time voice agents: WebSocket streaming, voice cloning, 8/16/24 kHz output, Opus or PCM, continuous batching on a single GPU.
 
-VoxServe delivers low-latency, high-throughput inference for Speech Language Models (SpeechLMs), including text-to-speech (TTS) and speech-to-speech (STS) models.
+**Default model:** `Qwen/Qwen3-TTS-12Hz-1.7B-Base`
 
-## News
+---
 
-- **[2025-02]** Blog post: [Light-Speed Qwen3-TTS Serving at Scale with VoxServe](https://vox-serve.github.io/2026/02/09/qwen3-tts-support.html)
-- **[2025-02]** Paper released: [VoxServe: A Streaming-Centric Serving System for Speech Language Models](https://arxiv.org/abs/2602.00269)
+## Requirements
 
-## Quick Start
+- Linux + NVIDIA GPU (CUDA 12.8 recommended)
+- For Docker: Docker Engine, Compose v2, [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)
+- For native run: Python 3.12+
 
-Install via pip and start the server:
+---
+
+## Quick start (Docker)
 
 ```bash
-pip install vox-serve
-vox-serve --model <model-name> --port <port-number>
+git clone https://github.com/reactivespace/Qwen3-TTS.git
+cd Qwen3-TTS
+docker compose up -d --build
 ```
 
-Or install from source:
+First boot downloads model weights into a Docker volume (several minutes). Then:
 
 ```bash
-git clone https://github.com/vox-serve/vox-serve.git
-cd vox-serve
+curl http://localhost:2200/health
+# {"status":"healthy"}
+```
+
+More detail: [DOCKER.md](DOCKER.md)
+
+Optional config — copy `.env.example` to `.env`:
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `PORT` | `2200` | Host port |
+| `MODEL` | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | Hugging Face model id |
+| `MAX_BATCH_SIZE` | `64` | Max concurrent decode batch |
+| `MAX_NUM_PAGES` | `2048` | KV cache pages |
+| `DETOKENIZE_INTERVAL` | `5` | Codec frames before each audio chunk (~400 ms @ 24 kHz) |
+| `HF_TOKEN` | — | Hugging Face token if needed |
+| `NVIDIA_VISIBLE_DEVICES` | `all` | GPU selection |
+
+---
+
+## Native run (without Docker)
+
+```bash
+git clone https://github.com/reactivespace/Qwen3-TTS.git
+cd Qwen3-TTS
+python3.12 -m venv .venv && source .venv/bin/activate
 pip install -e .
-python -m vox_serve.launch --model <model-name> --port <port-number>
-```
 
-Send requests to the server:
+export VOX_METRICS_DIR=/var/log/vox-serve
+mkdir -p /var/log/vox-serve
 
-```bash
-# Text-to-speech
-curl -X POST "http://localhost:<port-number>/generate" \
-  -F "text=Hello world" -F "streaming=true" -o output.wav
-
-# Speech-to-speech (for models with audio input support)
-curl -X POST "http://localhost:<port-number>/generate" \
-  -F "text=Hello world" -F "@input.wav" -F "streaming=true" -o output.wav
-```
-
-See the [`examples/`](examples/) directory for more usage examples.
-
-## Running the Server
-
-Launch a server with `python -m vox_serve.launch` (or the `vox-serve` console script):
-
-```bash
 python -m vox_serve.launch \
-  --model zonos \
-  --host 0.0.0.0 --port 8000 \
+  --model Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+  --host 0.0.0.0 --port 2200 \
   --scheduler-type online \
   --async-scheduling \
-  --max-batch-size 64
+  --max-batch-size 64 \
+  --max-num-pages 2048 \
+  --detokenize-interval 5 \
+  --unroll-depth-cuda-graph \
+  --log-level INFO
 ```
 
-Common options (see `python -m vox_serve.launch --help` for the full list):
+---
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--model` | `canopylabs/orpheus-3b-0.1-ft` | Model name (see table below) or HF path |
-| `--host` | `0.0.0.0` | Bind address |
-| `--port` | `8000` | Bind port |
-| `--scheduler-type` | `base` | `base`, `online`, `offline`, or `input_streaming` |
-| `--async-scheduling` | off | Overlap scheduling with GPU work (lower latency) |
-| `--max-batch-size` | `8` | Max concurrent requests batched together |
-| `--max-num-pages` | `2048` | KV cache pages (raise for more concurrency) |
-| `--enable-cuda-graph` / `--disable-cuda-graph` | on | CUDA graph capture for the decode phase |
-| `--dp-size` | `1` | Data-parallel replicas across GPUs |
-| `--enable-disaggregation` | off | Split LLM / detokenizer across 2 GPUs |
-| `--log-level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
+## API
 
-For the lowest streaming latency under load, use `--scheduler-type online --async-scheduling` and size `--max-batch-size` to your expected concurrency.
+Base URL: `http://HOST:2200`  
+Interactive docs: `http://HOST:2200/docs`
 
-Check the server is up:
+> **`POST /generate` is disabled** (returns `410`). Use **WebSocket `/ws`** for synthesis.
+
+### Health & metrics
 
 ```bash
-curl http://localhost:8000/health   # -> {"status":"healthy"}
+curl http://HOST:2200/health
+curl http://HOST:2200/stats
+curl "http://HOST:2200/stats/requests?limit=20"
+curl "http://HOST:2200/stats/log?lines=40"
 ```
 
-## API Reference
+Metrics are also written under `/var/log/vox-serve/` (or `$VOX_METRICS_DIR`):
 
-Interactive OpenAPI docs are served at **`http://<host>:<port>/docs`** (Swagger UI) and **`/redoc`** once the server is running.
+- `requests.jsonl` — one JSON line per finished request (TTFA, total ms, KV memory)
+- `stats.json` — latest live snapshot
+- `stats.log` — rolling text log
 
-### `POST /generate` — synthesize speech
-
-Multipart form fields:
-
-| Field | Required | Description |
-|-------|----------|-------------|
-| `text` | yes | Text to synthesize |
-| `streaming` | no (default `true`) | Stream a WAV (`true`) or return a complete file (`false`) |
-| `sample_rate` | no (default `24000`) | Output sample rate in Hz: `8000`, `16000`, or `24000` |
-| `audio` | no | Reference audio file for voice cloning (uploaded per request) |
-| `voice_id` | no | Pre-registered voice (see `/voices`) — clone with **no per-request upload** |
-| `language`, `speaker`, `ref_text`, `instruct`, `x_vector_only_mode` | no | Model-specific parameters |
+### Voices (register once, reuse by id)
 
 ```bash
-# Default voice, streaming
-curl -X POST http://localhost:8000/generate \
-  -F "text=Hello world" -F "streaming=true" -o out.wav
+# Add
+curl -X POST http://HOST:2200/voices \
+  -F "audio=@reference.wav" -F "voice_id=laura"
 
-# 16 kHz output
-curl -X POST http://localhost:8000/generate \
-  -F "text=Hello world" -F "streaming=true" -F "sample_rate=16000" -o out_16k.wav
+# List
+curl http://HOST:2200/voices
 
-# Voice cloning by uploading a reference each request
-curl -X POST http://localhost:8000/generate \
-  -F "text=Hello world" -F "audio=@reference.wav" -F "streaming=true" -o out.wav
-
-# Voice cloning by pre-registered voice_id (recommended, no upload)
-curl -X POST http://localhost:8000/generate \
-  -F "text=Hello world" -F "voice_id=my-voice" -F "streaming=true" -o out.wav
+# Delete
+curl -X DELETE http://HOST:2200/voices/laura
 ```
 
-### Voice registry — register once, clone without re-uploading
+### WebSocket `/ws` (primary)
 
-Uploading the reference audio on every request is wasteful over a network. Register a voice once and reference it by `voice_id`:
+Open one connection and send many utterances.
 
-```bash
-# Register (returns {"voice_id": "...", "bytes": N}); voice_id is optional
-curl -X POST http://localhost:8000/voices \
-  -F "audio=@reference.wav" -F "voice_id=my-voice"
-
-# List registered voices
-curl http://localhost:8000/voices          # -> {"voices": ["my-voice", ...]}
-
-# Delete a voice
-curl -X DELETE http://localhost:8000/voices/my-voice
-```
-
-Registered voices persist across restarts. The server also caches the computed speaker embedding, so repeated requests for the same voice skip re-encoding.
-
-### `WS /ws` — persistent WebSocket streaming (lowest latency)
-
-Open one connection and reuse it for many utterances, paying the TCP/TLS handshake only once. Optionally receive **Opus** audio (~8× smaller than raw PCM, transparent for speech).
-
-Client → server (one JSON message per utterance):
-
-```json
-{"text": "Hello world", "voice_id": "my-voice", "format": "opus"}
-```
-
-`format` is `"pcm"` (raw int16, default) or `"opus"`. Use `"audio_base64"` for a one-off reference instead of `voice_id`. Optional `"sample_rate"` of `8000`, `16000`, or `24000` (default) resamples the native 24 kHz model output; Opus encodes at the requested rate. Send `{"type": "close"}` to end the session.
-
-**Zonos conditioning controls** (all optional, per utterance):
+**Client → server** (JSON per utterance):
 
 ```json
 {
-  "text": "I'm so excited to see you!",
-  "voice_id": "my-voice",
-  "speaking_rate": 20,
-  "pitch_std": 90,
-  "emotion": [0.8, 0, 0, 0, 0.1, 0, 0, 0.1]
+  "text": "Thank you for calling. How can I help you today?",
+  "voice_id": "laura",
+  "x_vector_only_mode": true,
+  "sample_rate": 8000,
+  "format": "pcm"
 }
 ```
 
-| field | range / format | default | meaning |
-| --- | --- | --- | --- |
-| `speaking_rate` | phonemes/min (~15 normal, 30 fast, 10 slow) | `15` | speaking speed |
-| `pitch_std` | 20–45 normal, 60–150 expressive | `20` | pitch variation / expressiveness |
-| `emotion` | 8-value list `[happiness, sadness, disgust, fear, surprise, anger, other, neutral]` (auto-normalized) | `[0.35,0,0,0,0,0,0.15,0.5]` | emotional tone |
+| Field | Required | Description |
+|-------|----------|-------------|
+| `text` | yes | Text to speak |
+| `voice_id` | recommended | Registered voice |
+| `x_vector_only_mode` | recommended `true` | Clone from reference audio without `ref_text` |
+| `sample_rate` | no | `8000`, `16000`, or `24000` (default) |
+| `format` | no | `pcm` (default) or `opus` |
+| `language` | no | e.g. `english` |
+| `audio_base64` | no | One-off reference WAV instead of `voice_id` |
 
-Emotion is entangled with pitch — stronger emotion usually pairs well with a higher `pitch_std`.
+**Server → client**
 
-The defaults are tuned for **call-center agents**: a clear, natural pace; steady/professional pitch; and a friendly-yet-neutral tone with no negative affect. They apply to every request (all endpoints) unless overridden. Change the global defaults via env vars: `VOX_ZONOS_SPEAKING_RATE`, `VOX_ZONOS_PITCH_STD`, `VOX_ZONOS_EMOTION` (comma-separated 8 values).
+1. `{"type":"start","request_id":"...","sample_rate":8000,"channels":1,"format":"pcm_s16le"}`
+2. Binary frames — PCM int16 mono chunks (~400 ms each), or Opus 20 ms packets
+3. `{"type":"end","request_id":"..."}`
 
-Server → client, per utterance:
+Errors: `{"type":"error","detail":"..."}` (socket stays open).
+
+**PCM chunk sizes (approx.)**
+
+| `sample_rate` | Bytes / frame | Duration |
+|---------------|---------------|----------|
+| 24000 | 19200 | ~400 ms |
+| 16000 | 12800 | ~400 ms |
+| 8000 | 6400 | ~400 ms |
+
+Browser tester: open [`index.html`](index.html) and set the server URL.
+
+---
+
+## Useful launch flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--model` | — | HF model id (use Qwen3-TTS Base for cloning) |
+| `--port` | `8000` | HTTP / WS port |
+| `--scheduler-type` | `base` | Use `online` for streaming agents |
+| `--async-scheduling` | off | Overlap scheduling with GPU work |
+| `--max-batch-size` | `8` | Concurrent decode capacity |
+| `--max-num-pages` | `2048` | KV pages (memory for concurrency) |
+| `--detokenize-interval` | model default | Frames per audio chunk (lower → faster TTFA) |
+| `--unroll-depth-cuda-graph` | off | Faster depth transformer for Qwen3 |
+| `--output-dir` | `/tmp/vox_serve_audio` | Uploads + registered voices (`VOX_OUTPUT_DIR`) |
+
+---
+
+## Project layout
 
 ```
-{"type": "start", "request_id": "...", "sample_rate": 16000, "channels": 1, "format": "opus", "frame_ms": 20}
-<binary frame> <binary frame> ...   # PCM chunks, or one Opus packet per frame
-{"type": "end", "request_id": "..."}
+Dockerfile / docker-compose.yml   # one-command GPU deploy
+docker/entrypoint.sh
+vox_serve/                        # server + scheduler + Qwen3 model
+index.html                        # simple WebSocket TTS tester
+DOCKER.md                         # Docker notes
 ```
 
-Errors arrive as `{"type": "error", "detail": "..."}` without closing the socket. Opus bitrate defaults to 48 kbps (override with the `VOX_OPUS_BITRATE` env var).
+---
 
-### Incremental text input (`input_streaming` scheduler)
+## License
 
-For LLM → TTS pipelines, start a request and feed text as it is generated. Requires `--scheduler-type input_streaming`.
-
-```bash
-# Start (optionally with -F "audio=@reference.wav"); returns {"request_id": "..."}
-curl -X POST http://localhost:8000/generate/stream/start
-curl -X POST http://localhost:8000/generate/stream/<request_id>/text -F "text=Hello "
-curl -X POST http://localhost:8000/generate/stream/<request_id>/text -F "text=world."
-curl        http://localhost:8000/generate/stream/<request_id>/audio -o out.wav   # stream audio
-curl -X POST http://localhost:8000/generate/stream/<request_id>/end
-```
-
-### `POST /v1/audio/speech` — OpenAI-compatible
-
-Streams raw int16 PCM. Accepts `{"input": "...", "voice": "...", "language": "...", "stream": true}`.
-
-### Benchmarking / load testing
-
-The [`benchmark/`](benchmark/) directory includes concurrency and TTFA testers:
-
-```bash
-# HTTP concurrency (byid = register-once voice, clone = upload each request, noclone)
-python benchmark/concurrency_test.py 64 byid
-
-# WebSocket + Opus concurrency (saves a playable ws_sample.wav)
-python benchmark/ws_client.py 64 opus
-```
-
-## Supported Models
-
-VoxServe supports the following TTS and STS models:
-
-| Model | Type | Link |
-|-------|------|------|
-| `chatterbox` | TTS | [Chatterbox TTS](https://huggingface.co/ResembleAI/chatterbox) |
-| `cosyvoice2` | TTS | [CosyVoice2-0.5B](https://huggingface.co/FunAudioLLM/CosyVoice2-0.5B) |
-| `csm` | TTS | [CSM-1B](https://huggingface.co/sesame/csm-1b) |
-| `orpheus` | TTS | [Orpheus-3B](https://huggingface.co/canopylabs/orpheus-3b-0.1-ft) |
-| `qwen3-tts` | TTS | [Qwen3-TTS-1.7B](https://huggingface.co/collections/Qwen/qwen3-tts) |
-| `zonos` | TTS | [Zonos-v0.1](https://huggingface.co/Zyphra/Zonos-v0.1-transformer) |
-| `glm` | STS | [GLM-4-Voice-9B](https://huggingface.co/zai-org/glm-4-voice-9b) |
-| `step` | STS | [Step-Audio-2-Mini](https://huggingface.co/stepfun-ai/Step-Audio-2-mini) |
-
-See the [models documentation](https://vox-serve.github.io/vox-serve/models.html) for detailed information. More models coming soon.
-
-## Demos
-
-### Ultra-Low Latency
-
-VoxServe is optimized for real-time speech synthesis. The demo below shows a TTS request achieving **40 ms** Time-To-First-Audio (TTFA) on an NVIDIA H100 GPU with `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`.
-
-<a href="https://vimeo.com/1163095537">
-  <img src="https://vumbnail.com/1163095537.jpg" alt="Ultra-Low Latency Demo" width="600">
-</a>
-
-### Real-Time LLM Integration
-
-Qwen3-TTS supports incremental text input, enabling seamless integration with LLMs for voice chatbots. The demo below shows VoxServe connected to a local LLM with low end-to-end latency.
-
-<a href="https://vimeo.com/1163095770">
-  <img src="https://vumbnail.com/1163095770.jpg" alt="LLM Integration Demo" width="600">
-</a>
-
-## Playground
-
-VoxServe includes a web-based playground for interactive testing. Use the browser UI to manage servers, generate audio, and view real-time logs.
-
-![VoxServe Playground](examples/playground/static/images/playground-sample.png)
-
-See [examples/playground/README.md](examples/playground/README.md) for setup instructions.
+See [LICENSE](LICENSE).
