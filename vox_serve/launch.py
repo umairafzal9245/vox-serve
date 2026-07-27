@@ -1156,6 +1156,8 @@ def _resolve_audio_and_kwargs(msg: dict):
     ):
         if msg.get(key) is not None:
             model_kwargs[key] = msg[key]
+    if voice_id:
+        model_kwargs["voice_id"] = voice_id
 
     return audio_path, is_temp_audio, model_kwargs
 
@@ -1542,6 +1544,72 @@ async def end_input_streaming(request_id: str):
 async def health_check():
     """Health check endpoint"""
     return {"status": "healthy"}
+
+
+def _metrics_dir() -> Path:
+    return Path(os.environ.get("VOX_METRICS_DIR", "/var/log/vox-serve"))
+
+
+@app.get("/stats")
+async def server_stats():
+    """Live scheduler snapshot: active requests, latency percentiles, GPU + KV memory.
+
+    Remote example: ``curl http://HOST:2200/stats``
+    """
+    stats_path = _metrics_dir() / "stats.json"
+    if not stats_path.exists():
+        raise HTTPException(
+            status_code=503,
+            detail=f"No metrics yet at {stats_path}. Wait a few seconds after the server starts.",
+        )
+    try:
+        return json.loads(stats_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read metrics: {e}") from e
+
+
+@app.get("/stats/requests")
+async def server_stats_requests(limit: int = 50):
+    """Recent completed requests (from ``requests.jsonl``), newest last.
+
+    Remote example: ``curl 'http://HOST:2200/stats/requests?limit=20'``
+    """
+    limit = max(1, min(int(limit), 1000))
+    path = _metrics_dir() / "requests.jsonl"
+    if not path.exists():
+        return {"count": 0, "requests": []}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        rows = []
+        for line in lines[-limit:]:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return {"count": len(rows), "requests": rows}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read request log: {e}") from e
+
+
+@app.get("/stats/log")
+async def server_stats_log(lines: int = 40):
+    """Tail of the human-readable metrics log.
+
+    Remote example: ``curl 'http://HOST:2200/stats/log?lines=40'``
+    """
+    lines = max(1, min(int(lines), 500))
+    path = _metrics_dir() / "stats.log"
+    if not path.exists():
+        return {"text": "", "path": str(path)}
+    try:
+        content = path.read_text(encoding="utf-8").splitlines()
+        tail = "\n".join(content[-lines:])
+        return {"text": tail, "path": str(path), "lines": min(lines, len(content))}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read stats log: {e}") from e
 
 
 @app.on_event("shutdown")

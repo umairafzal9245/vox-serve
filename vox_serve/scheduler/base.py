@@ -1,6 +1,8 @@
 import asyncio
 import json
+import os
 import time
+from datetime import datetime, timezone
 from typing import List
 
 import torch
@@ -11,6 +13,7 @@ from ..requests import Request
 from ..sampling import SamplingConfig
 from ..utils import get_logger
 from ..worker import CudaGraphWorker, ModelWorker
+from ..metrics import MetricsTracker, utc_iso
 
 
 class Scheduler:
@@ -135,6 +138,22 @@ class Scheduler:
         self.bytes_per_sample = 2  # 16-bit = 2 bytes
         self.channels = 1  # mono
 
+        # Persistent metrics (active requests, latency, per-request KV memory)
+        model_name = getattr(self.model_worker, "model_name", None) or model_name_or_path
+        self.metrics = MetricsTracker(
+            bytes_per_kv_page=self.model_worker.bytes_per_kv_page(),
+            max_num_pages=getattr(self.model_worker, "max_num_pages", 0),
+            page_size=getattr(self.model_worker, "page_size", 128),
+            interval_sec=float(os.environ.get("VOX_METRICS_INTERVAL", "5")),
+            model_name=model_name,
+        )
+        self.logger.info(
+            "Metrics writing to %s (bytes/kv_page=%.1f KiB, max_pages=%d)",
+            self.metrics.metrics_dir,
+            self.metrics.bytes_per_kv_page / 1024.0,
+            self.metrics.max_num_pages,
+        )
+
     def _step(self):
         """
         Process the next batch of requests.
@@ -219,22 +238,9 @@ class Scheduler:
 
     async def _run_async_loop(self):
         task, lm_requests, detokenize_requests = None, [], []
-        last_state_dump = time.time()
         while True:
             task, lm_requests, detokenize_requests = await self._step_async(task, lm_requests, detokenize_requests)
-
-            # Periodic state dump for diagnosing stuck requests
-            now = time.time()
-            if now - last_state_dump > 5.0 and self.active_requests:
-                last_state_dump = now
-                for req in self.active_requests:
-                    n_tok = len(req.lm_output_audio_tokens) if req.lm_output_audio_tokens is not None else 0
-                    next_idx = req.next_audio_decode_idx[-1] if req.next_audio_decode_idx else -1
-                    self.logger.info(
-                        f"[STATE] {req.request_id[:8]} prefill={req.done_lm_prefill} "
-                        f"lm_done={req.done_lm_generation} all={req.done_all} "
-                        f"tokens={n_tok} next_idx={next_idx} pressing={req.is_pressing}"
-                    )
+            self._maybe_log_metrics()
             await asyncio.sleep(0)
 
     def run_forever(self):
@@ -246,8 +252,39 @@ class Scheduler:
         else:
             while True:
                 self._step()
+                self._maybe_log_metrics()
                 torch.cuda.synchronize()
 
+    def _gpu_mem_gib(self):
+        try:
+            device = self.model_worker.device
+            alloc = torch.cuda.memory_allocated(device) / 2**30
+            reserved = torch.cuda.memory_reserved(device) / 2**30
+            return round(alloc, 2), round(reserved, 2)
+        except Exception:
+            return None, None
+
+    def _maybe_log_metrics(self):
+        alloc, reserved = self._gpu_mem_gib()
+        snap = self.metrics.maybe_dump_snapshot(
+            active_requests=self.active_requests,
+            free_pages=self.model_worker.free_pages_count(),
+            gpu_alloc_gib=alloc,
+            gpu_reserved_gib=reserved,
+        )
+        if snap is not None:
+            self.logger.info(
+                "[METRICS] active=%d pages=%d/%d kv=%.1fMiB gpu_alloc=%sGiB "
+                "ttfa_p50=%s ttfa_p90=%s completed=%d",
+                snap["active_count"],
+                snap["pages"]["used"],
+                snap["pages"]["max"],
+                snap["pages"]["used_mib"],
+                snap["gpu"]["allocated_gib"],
+                snap["latency_recent"]["ttfa_p50_ms"],
+                snap["latency_recent"]["ttfa_p90_ms"],
+                snap["completed_count"],
+            )
     def _select_lm_requests(self):
         """
         Select requests that need LM processing.
@@ -354,6 +391,60 @@ class Scheduler:
 
         return detokenize_requests
 
+    def _record_chunk_send(self, req: Request, audio_chunk: bytes):
+        send_time = time.time()
+        if req.is_streaming:
+            duration = self._calculate_chunk_duration(audio_chunk)
+            req.chunk_send_timestamps.append(send_time)
+            req.chunk_durations.append(duration)
+        if req.first_audio_time is None:
+            req.first_audio_time = send_time
+            if req.admit_time is not None:
+                ttfa_ms = (send_time - req.admit_time) * 1000.0
+                self.logger.info(
+                    "[TTFA] %s %.0fms pages=%d (%.2fMiB)",
+                    req.request_id[:8],
+                    ttfa_ms,
+                    len(req.kv_pages) if req.kv_pages else 0,
+                    self.metrics.kv_mib_for_pages(len(req.kv_pages) if req.kv_pages else 0),
+                )
+
+    def _complete_request_metrics(self, req: Request):
+        if req.completion_recorded:
+            return
+        req.completion_recorded = True
+        now = time.time()
+        n_pages = len(req.kv_pages) if req.kv_pages else 0
+        admit = req.admit_time or now
+        first = req.first_audio_time
+        record = {
+            "request_id": req.request_id,
+            "finish_reason": req.finish_reason or "unknown",
+            "streaming": bool(req.is_streaming),
+            "prompt_chars": len(req.prompt) if req.prompt else 0,
+            "tokens": len(req.lm_output_audio_tokens) if req.lm_output_audio_tokens else 0,
+            "chunks": len(req.chunk_send_timestamps),
+            "audio_sec": round(sum(req.chunk_durations), 3) if req.chunk_durations else 0.0,
+            "ttfa_ms": round((first - admit) * 1000.0, 1) if first is not None else None,
+            "total_ms": round((now - admit) * 1000.0, 1),
+            "kv_pages_peak": n_pages,
+            "kv_mib": round(self.metrics.kv_mib_for_pages(n_pages), 2),
+            "voice": (req.model_kwargs or {}).get("voice_id"),
+            "admit_ts": utc_iso(datetime.fromtimestamp(admit, tz=timezone.utc)) if admit else None,
+            "first_audio_ts": utc_iso(datetime.fromtimestamp(first, tz=timezone.utc)) if first else None,
+        }
+        self.metrics.record_complete(record)
+        self.logger.info(
+            "[DONE] %s total=%.0fms ttfa=%s tokens=%d pages=%d (%.2fMiB) audio=%.1fs",
+            req.request_id[:8],
+            record["total_ms"],
+            record["ttfa_ms"],
+            record["tokens"],
+            n_pages,
+            record["kv_mib"],
+            record["audio_sec"],
+        )
+
     def _send_responses(self, detokenize_requests):
         """
         Send responses back to clients for detokenized requests (sync version).
@@ -362,27 +453,21 @@ class Scheduler:
             while not req.output_audio.empty():
                 # Send audio chunk message: request_id|AUDIO|audio_data
                 audio_chunk = req.output_audio.get()
-
-                # Record timestamp and duration for streaming requests
-                if req.is_streaming:
-                    send_time = time.time()
-                    duration = self._calculate_chunk_duration(audio_chunk)
-                    req.chunk_send_timestamps.append(send_time)
-                    req.chunk_durations.append(duration)
-
+                self._record_chunk_send(req, audio_chunk)
                 message = req.request_id.encode("utf-8") + b"|AUDIO|" + audio_chunk
                 self.result_socket.send(message)
 
             # send completion notification for finished requests
             if req.done_all:
-                self.model_worker.free_kv_cache(req)
-                completion_message = {"status": "completed", "reason": req.finish_reason or "unknown"}
-                # Send completion message: request_id|COMPLETION|json_data
-                completion_payload = (
-                    req.request_id.encode("utf-8") + b"|COMPLETION|" + json.dumps(completion_message).encode("utf-8")
-                )
-                self.logger.debug("Sending completion for request %s", req.request_id)
-                self.result_socket.send(completion_payload)
+                if not req.completion_recorded:
+                    self._complete_request_metrics(req)
+                    self.model_worker.free_kv_cache(req)
+                    completion_message = {"status": "completed", "reason": req.finish_reason or "unknown"}
+                    completion_payload = (
+                        req.request_id.encode("utf-8") + b"|COMPLETION|" + json.dumps(completion_message).encode("utf-8")
+                    )
+                    self.logger.debug("Sending completion for request %s", req.request_id)
+                    self.result_socket.send(completion_payload)
 
     async def _send_responses_async(self, detokenize_requests):
         """
@@ -392,27 +477,21 @@ class Scheduler:
             while not req.output_audio.empty():
                 # Send audio chunk message: request_id|AUDIO|audio_data
                 audio_chunk = req.output_audio.get()
-
-                # Record timestamp and duration for streaming requests
-                if req.is_streaming:
-                    send_time = time.time()
-                    duration = self._calculate_chunk_duration(audio_chunk)
-                    req.chunk_send_timestamps.append(send_time)
-                    req.chunk_durations.append(duration)
-
+                self._record_chunk_send(req, audio_chunk)
                 message = req.request_id.encode("utf-8") + b"|AUDIO|" + audio_chunk
                 await self.result_socket.send(message)
 
             # send completion notification for finished requests
             if req.done_all:
-                self.model_worker.free_kv_cache(req)
-                completion_message = {"status": "completed", "reason": req.finish_reason or "unknown"}
-                # Send completion message: request_id|COMPLETION|json_data
-                completion_payload = (
-                    req.request_id.encode("utf-8") + b"|COMPLETION|" + json.dumps(completion_message).encode("utf-8")
-                )
-                self.logger.debug("Sending completion for request %s", req.request_id)
-                await self.result_socket.send(completion_payload)
+                if not req.completion_recorded:
+                    self._complete_request_metrics(req)
+                    self.model_worker.free_kv_cache(req)
+                    completion_message = {"status": "completed", "reason": req.finish_reason or "unknown"}
+                    completion_payload = (
+                        req.request_id.encode("utf-8") + b"|COMPLETION|" + json.dumps(completion_message).encode("utf-8")
+                    )
+                    self.logger.debug("Sending completion for request %s", req.request_id)
+                    await self.result_socket.send(completion_payload)
 
     def _calculate_chunk_duration(self, audio_chunk: bytes) -> float:
         """
@@ -448,6 +527,7 @@ class Scheduler:
             if cfg_alpha is not None:
                 new_request.sampling_config = SamplingConfig(cfg_scale=float(cfg_alpha))
 
+            new_request.admit_time = time.time()
             self.logger.info(f"[ADMIT] {new_request.request_id[:8]}")
             return new_request
         else:

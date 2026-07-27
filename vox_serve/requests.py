@@ -75,6 +75,11 @@ class Request:
     chunk_send_timestamps: List[float] = field(default_factory=list)  # when each chunk was sent
     chunk_durations: List[float] = field(default_factory=list)  # duration of each chunk in seconds
 
+    # metrics / latency
+    admit_time: float = None  # when scheduler admitted the request
+    first_audio_time: float = None  # when first AUDIO chunk was sent
+    completion_recorded: bool = False  # metrics/COMPLETION emitted once
+
 
 class LMInputs(TypedDict):
     """Typed container for scheduler-prepared inputs for LM steps."""

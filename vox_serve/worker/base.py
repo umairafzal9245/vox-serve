@@ -786,6 +786,17 @@ class ModelWorker:
             torch.cuda.synchronize()
             torch.cuda.nvtx.range_pop()
 
+    def bytes_per_kv_page(self) -> int:
+        """GPU bytes reserved for one KV page across all layers (bf16 K+V)."""
+        if not hasattr(self, "kv_cache") or self.kv_cache is None:
+            return 0
+        # kv_cache: (layers, pages, 2, page_size, kv_heads, head_dim)
+        layers, _pages, kv, page_size, kv_heads, head_dim = self.kv_cache.shape
+        return int(layers * kv * page_size * kv_heads * head_dim * self.kv_cache.element_size())
+
+    def free_pages_count(self) -> int:
+        return self.empty_pages.qsize()
+
     def free_kv_cache(self, request: Request):
         """
         Free the KV cache pages that was used by the request.
