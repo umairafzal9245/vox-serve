@@ -1185,11 +1185,11 @@ class Qwen3TTSModel(BaseLMWithDepth):
         ]
 
         self.default_sampling_config = SamplingConfig(
-            top_k=50,
+            top_k=40,
             top_p=1.0,
             min_p=None,
-            temperature=0.9,
-            repetition_penalty=1.05,
+            temperature=0.7,
+            repetition_penalty=1.2,
             repetition_window=-1,  # global window so repetition_cache is always created when penalty is used
             cfg_scale=None,
         )
