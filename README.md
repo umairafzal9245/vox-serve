@@ -83,7 +83,7 @@ python -m vox_serve.launch \
 Base URL: `http://HOST:2200`  
 Interactive docs: `http://HOST:2200/docs`
 
-> **`POST /generate` is disabled** (returns `410`). Use **WebSocket `/ws`** for synthesis.
+> **`POST /generate` is disabled** (returns `410`). Use **WebSocket `/ws`** or **SSE `POST /stream`** for synthesis.
 
 ### Health & metrics
 
@@ -157,6 +157,39 @@ Errors: `{"type":"error","detail":"..."}` (socket stays open).
 | 8000 | 6400 | ~400 ms |
 
 Browser tester: open [`index.html`](index.html) and set the server URL.
+
+### SSE `POST /stream` (no WebSocket)
+
+One HTTP request = one utterance. Same JSON fields as `/ws`; audio arrives as SSE events with base64 payloads (SSE is text-only).
+
+```bash
+curl -N -X POST http://HOST:2200/stream \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "text": "Thank you for calling. How can I help you today?",
+    "voice_id": "laura",
+    "x_vector_only_mode": true,
+    "sample_rate": 8000,
+    "format": "pcm"
+  }'
+```
+
+**Server → client** (`Content-Type: text/event-stream`):
+
+```
+event: start
+data: {"type":"start","request_id":"...","sample_rate":8000,"channels":1,"format":"pcm_s16le","frame_ms":null}
+
+event: audio
+data: {"type":"audio","data":"<base64 pcm or opus packet>"}
+
+event: end
+data: {"type":"end","request_id":"..."}
+```
+
+Errors before the stream starts return HTTP `400`/`503` JSON. Mid-stream failures emit `event: error` then close.
+
+Decode each `audio` event’s `data` field with base64 → raw int16 PCM (or Opus packets when `format` is `opus`).
 
 ---
 

@@ -17,7 +17,7 @@ import time
 import uuid
 import wave
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional
 
 import torch
 import zmq
@@ -853,7 +853,7 @@ async def generate(
     """
     raise HTTPException(
         status_code=410,
-        detail="/generate is disabled. Use WebSocket /ws for synthesis.",
+        detail="/generate is disabled. Use WebSocket /ws or SSE POST /stream for synthesis.",
     )
 
     if api_server is None:
@@ -1126,7 +1126,7 @@ class OpusStreamEncoder:
 
 
 def _resolve_audio_and_kwargs(msg: dict):
-    """Resolve reference audio path and model kwargs from a WS request dict.
+    """Resolve reference audio path and model kwargs from a WS/SSE request dict.
 
     Returns ``(audio_path, is_temp_audio, model_kwargs)``. Supports a
     pre-registered ``voice_id`` (no upload, preferred) or inline
@@ -1160,6 +1160,59 @@ def _resolve_audio_and_kwargs(msg: dict):
         model_kwargs["voice_id"] = voice_id
 
     return audio_path, is_temp_audio, model_kwargs
+
+
+def _sse_event(event: str, payload: dict) -> bytes:
+    """Format one Server-Sent Event frame."""
+    return f"event: {event}\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n".encode()
+
+
+async def _iter_encoded_audio_chunks(
+    request_id: str, out_sr: int, use_opus: bool
+) -> AsyncIterator[bytes]:
+    """Yield resampled PCM chunks or Opus packets for a streaming request."""
+    resampler = (
+        PcmResampler(_NATIVE_SAMPLE_RATE, out_sr)
+        if out_sr != _NATIVE_SAMPLE_RATE
+        else None
+    )
+    opus_enc = OpusStreamEncoder(out_sr) if use_opus else None
+
+    async for chunk in api_server.async_stream_chunks(request_id):
+        if not chunk:
+            continue
+        if resampler is not None:
+            chunk = resampler.process(chunk)
+            if not chunk:
+                continue
+        if opus_enc is not None:
+            for pkt in opus_enc.encode(chunk):
+                yield pkt
+        else:
+            yield chunk
+
+    if opus_enc is not None:
+        for pkt in opus_enc.flush():
+            yield pkt
+
+
+class StreamRequest(BaseModel):
+    """JSON body for ``POST /stream`` — same fields as one ``/ws`` utterance."""
+
+    text: str
+    voice_id: Optional[str] = None
+    audio: Optional[str] = None
+    audio_base64: Optional[str] = None
+    format: Optional[str] = "pcm"
+    sample_rate: Optional[int] = None
+    language: Optional[str] = None
+    speaker: Optional[str] = None
+    ref_text: Optional[str] = None
+    instruct: Optional[str] = None
+    x_vector_only_mode: Optional[bool] = None
+    speaking_rate: Optional[float] = None
+    pitch_std: Optional[float] = None
+    emotion: Optional[List[Any]] = None
 
 
 @app.websocket("/ws")
@@ -1221,12 +1274,6 @@ async def ws_generate(websocket: WebSocket):
                 audio_path, is_temp_audio, model_kwargs = _resolve_audio_and_kwargs(msg)
                 request_id = api_server.start_streaming_request(text, audio_path, model_kwargs)
 
-                resampler = (
-                    PcmResampler(_NATIVE_SAMPLE_RATE, out_sr)
-                    if out_sr != _NATIVE_SAMPLE_RATE
-                    else None
-                )
-                opus_enc = OpusStreamEncoder(out_sr) if use_opus else None
                 await websocket.send_json({
                     "type": "start",
                     "request_id": request_id,
@@ -1236,22 +1283,8 @@ async def ws_generate(websocket: WebSocket):
                     "frame_ms": _OPUS_FRAME_MS if use_opus else None,
                 })
 
-                async for chunk in api_server.async_stream_chunks(request_id):
-                    if not chunk:
-                        continue
-                    if resampler is not None:
-                        chunk = resampler.process(chunk)
-                        if not chunk:
-                            continue
-                    if opus_enc is not None:
-                        for pkt in opus_enc.encode(chunk):
-                            await websocket.send_bytes(pkt)
-                    else:
-                        await websocket.send_bytes(chunk)
-
-                if opus_enc is not None:
-                    for pkt in opus_enc.flush():
-                        await websocket.send_bytes(pkt)
+                async for chunk in _iter_encoded_audio_chunks(request_id, out_sr, use_opus):
+                    await websocket.send_bytes(chunk)
 
                 await websocket.send_json({"type": "end", "request_id": request_id})
             except ValueError as e:
@@ -1273,6 +1306,90 @@ async def ws_generate(websocket: WebSocket):
             await websocket.close()
         except Exception:  # noqa: BLE001
             pass
+
+
+@app.post("/stream")
+async def sse_generate(body: StreamRequest):
+    """One-shot SSE synthesis — same fields as ``/ws``, without WebSockets.
+
+    Request JSON mirrors one WebSocket utterance. Response is
+    ``text/event-stream`` with events ``start``, ``audio`` (base64 payload),
+    ``end``, or ``error``. One HTTP request = one utterance.
+    """
+    if api_server is None:
+        raise HTTPException(status_code=503, detail="Server not ready")
+
+    text = (body.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Missing 'text'")
+
+    msg = body.model_dump(exclude_none=True)
+    use_opus = str(msg.get("format", "pcm")).lower() == "opus"
+
+    try:
+        out_sr = _parse_sample_rate(msg.get("sample_rate"))
+        audio_path, is_temp_audio, model_kwargs = _resolve_audio_and_kwargs(msg)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    try:
+        request_id = api_server.start_streaming_request(text, audio_path, model_kwargs)
+    except HTTPException:
+        if is_temp_audio and audio_path and Path(audio_path).exists():
+            try:
+                Path(audio_path).unlink()
+            except OSError:
+                pass
+        raise
+    except Exception as e:
+        if is_temp_audio and audio_path and Path(audio_path).exists():
+            try:
+                Path(audio_path).unlink()
+            except OSError:
+                pass
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+    async def event_gen():
+        try:
+            yield _sse_event("start", {
+                "type": "start",
+                "request_id": request_id,
+                "sample_rate": out_sr,
+                "channels": 1,
+                "format": "opus" if use_opus else "pcm_s16le",
+                "frame_ms": _OPUS_FRAME_MS if use_opus else None,
+            })
+            async for chunk in _iter_encoded_audio_chunks(request_id, out_sr, use_opus):
+                yield _sse_event("audio", {
+                    "type": "audio",
+                    "data": base64.b64encode(chunk).decode("ascii"),
+                })
+            yield _sse_event("end", {"type": "end", "request_id": request_id})
+        except Exception as e:  # noqa: BLE001
+            api_server.logger.error(f"SSE synth error: {e}")
+            yield _sse_event("error", {
+                "type": "error",
+                "detail": str(e),
+                "request_id": request_id,
+            })
+        finally:
+            if is_temp_audio and audio_path and Path(audio_path).exists():
+                try:
+                    Path(audio_path).unlink()
+                except OSError:
+                    pass
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # ============================================================================
