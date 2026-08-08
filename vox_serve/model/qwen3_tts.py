@@ -1184,14 +1184,17 @@ class Qwen3TTSModel(BaseLMWithDepth):
             if i not in (self.config.talker_config.codec_eos_token_id,)
         ]
 
+        # Match Qwen generation_config.json — full nucleus (top_p=1.0) is critical for EOS.
+        # Sweep (20 reqs/config): official/vox_original = 100% EOS; cutting top_p raised runaway.
         self.default_sampling_config = SamplingConfig(
-            top_k=40,
+            top_k=50,
             top_p=1.0,
             min_p=None,
-            temperature=0.7,
-            repetition_penalty=1.2,
+            temperature=0.9,
+            repetition_penalty=1.05,
             repetition_window=-1,  # global window so repetition_cache is always created when penalty is used
             cfg_scale=None,
+            max_tokens=512,
         )
 
     @property

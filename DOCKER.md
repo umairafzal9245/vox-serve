@@ -58,7 +58,7 @@ Copy `.env.example` → `.env`:
 | `HF_CACHE_HOST` | `./docker/empty-hf` | Host HF cache used **during build** |
 | `HF_TOKEN` | — | Token for gated / rate-limited Hub access |
 | `MODEL` | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | Model id |
-| `MAX_BATCH_SIZE` | `64` | Concurrent decode batch |
+| `MAX_BATCH_SIZE` | `128` | Concurrent decode batch |
 | `PORT` | `2200` | Host port |
 
 ## Logs

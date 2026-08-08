@@ -45,7 +45,7 @@ Optional config — copy `.env.example` to `.env`:
 |----------|---------|---------|
 | `PORT` | `2200` | Host port |
 | `MODEL` | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | Hugging Face model id |
-| `MAX_BATCH_SIZE` | `64` | Max concurrent decode batch |
+| `MAX_BATCH_SIZE` | `128` | Max concurrent decode batch |
 | `MAX_NUM_PAGES` | `2048` | KV cache pages |
 | `DETOKENIZE_INTERVAL` | `5` | Codec frames before each audio chunk (~400 ms @ 24 kHz) |
 | `HF_TOKEN` | — | Hugging Face token if needed |
@@ -69,7 +69,7 @@ python -m vox_serve.launch \
   --host 0.0.0.0 --port 2200 \
   --scheduler-type online \
   --async-scheduling \
-  --max-batch-size 64 \
+  --max-batch-size 128 \
   --max-num-pages 2048 \
   --detokenize-interval 5 \
   --unroll-depth-cuda-graph \
